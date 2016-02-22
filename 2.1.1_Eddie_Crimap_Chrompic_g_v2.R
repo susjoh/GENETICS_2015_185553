@@ -16,7 +16,7 @@ library(dplyr)
 library(GenABEL)
 
 
-AnalysisSuffix <- "h"
+AnalysisSuffix <- "g"
 
 source("0_Crimap_Functions_Faster_v2.R")
 
