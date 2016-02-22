@@ -1,0 +1,2126 @@
+
+## Global control of recombination rate
+
+Author: Susan E. Johnston 
+
+```{r echo = F, warning = F, results = "hide", message = F}
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# 0. Set Working Environment and Load in Data  #
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+
+#~~ load functions and libraries
+
+library(beepr)
+library(ggplot2)
+library(asreml)
+library(GenABEL)
+library(reshape)
+library(plyr)
+
+source("r/recoderFunc.R")
+source("r/makeGRM.R")
+source("r/ASReml.EstEffects.R")
+source("r/ASReml.ExtractPredictors.R")
+source("r/GenABELPlotFunctions.R")
+source("r/multiplot.R")
+source("r/pin.R")
+std <- function(x) sd(x, na.rm = T)/sqrt(length(x))
+
+options(stringsAsFactors = F)
+
+#~~ set analysis parameters
+
+AnalysisSuffix <- "g"
+
+#~~ read in data
+
+# Individual chromosome data
+rectab     <- read.table(paste0("results/2_IndivRR_FullClean_", AnalysisSuffix, ".txt"), header = T, sep = "\t")
+
+# Individual summed data
+recsumm  <- read.table(paste0("results/2_TotalSummIndivRR_FullClean_", AnalysisSuffix, ".txt"), header = T, sep = "\t")
+
+# Pedigree
+pedigree <- read.table("data/pedigree_20130920.txt", header = T)
+
+# Simulation Results
+
+simtab <- read.table("results/4_SimulationResults.txt", header = T)
+
+
+# GenABEL data
+sheepabel <- load.gwaa.data(phe = "data/1_GenABEL_hornpheno20150126.txt",
+                            gen = "data/1_GenABEL_sheepabelFullQC20150129.gen")
+
+table(chromosome(sheepabel))
+
+sheepabel <- recodeChromosome(sheepabel, list("27"="X"))
+nsnps(sheepabel)
+
+
+# Map data 
+
+maptab <- read.table(paste0("results/2_Merged_map_", AnalysisSuffix, ".txt"), header = T)
+tail(maptab)
+maptab$Cumu <- cumsum(c(maptab$GenomicPosition[1], as.numeric(maptab$GenomicDiff)))[1:(nrow(maptab))]
+maxvals <- read.table("results/2_MaxVals_g.txt", header = T)
+
+# defopts
+
+defopts <- theme(axis.text.x  = element_text (size = 16),
+                 axis.text.y  = element_text (size = 14),
+                 strip.text.x = element_text (size = 16, vjust = 0.7),
+                 axis.title.y = element_text (size = 16, angle = 90, vjust = 0.2),
+                 axis.title.x = element_text (size = 16, vjust = 0.2),
+                 strip.background = element_blank())
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# 1. Prepare input for Analysis                              #
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+#~~ format pedigree
+
+names(pedigree)[1] <- "RRID"
+for(i in 1:3) pedigree[,i] <- as.factor(pedigree[,i])
+dim(pedigree)
+
+#~~ format data frames
+
+# rectab
+factorvec <- c("Chr", "Offspring.ID", "parent", "Family", "RRID", "FATHER",
+               "MOTHER", "RRID.SEX", "RRID.BYEAR", "Offspring.SEX",
+               "Offspring.BYEAR", "RRID.CAPAGE", "RRID.Offspring.ID",
+               "UniqueID", "UniqueID2", "MateID")
+
+rectab[,factorvec] <- lapply(rectab[,factorvec], as.factor)
+rm(factorvec)
+
+names(rectab)
+
+rectab <- rectab[,c("Family", "RRID", "RRID.SEX", "RRID.BYEAR", "RRID.CAPAGE", "RRID.Fhat3", 
+                    "MateID", "Mate.Fhat3", "Offspring.ID", "Offspring.SEX", "Offspring.BYEAR", 
+                    "Offspring.Fhat3", "Mean.FamR.wids", 
+                    "RRID.Offspring.ID", "UniqueID", "UniqueID2", "Chr", "Chromosome.Length", 
+                    "Chromosome.SNP.Count", "No.Inf.Loci", "Inf.Chr.Length", "First.Inf.Pos", 
+                    "Last.Inf.Pos", "Prop.Inf.Chromosome", "Prop.Inf.SNPs", "data.v2", 
+                    "RecombCount.v2", "RecombRate")]
+
+
+# recsumm
+factorvec <- c("RRID", "Offspring.ID", "UniqueID2", "Family", "RRID.SEX", 
+               "RRID.BYEAR", "Offspring.SEX", "Offspring.BYEAR", 
+               "RRID.CAPAGE", "MateID")
+
+recsumm[,factorvec] <- lapply(recsumm[,factorvec], as.factor)
+rm(factorvec)
+
+recsumm <- recsumm[,c("Family", "RRID", "RRID.SEX", "RRID.BYEAR", "RRID.CAPAGE", "RRID.Fhat3", 
+                      "MateID", "Mate.Fhat3", "Offspring.ID", "Offspring.SEX", 
+                      "Offspring.BYEAR", "Offspring.Fhat3", "Mean.FamR.woids",
+                      "TotalInfLoci", "TotalInfChrLenIncNonRecombs", "UninfChrCount",
+                      "TotalRecombCount", "TotalRecombRate", "TotalPropInfGenome",
+                      "NonRecombChrCount", "UniqueID2")]
+
+#~~ Adjust Recombination Rate to be a larger number (multiply by 1000) and create
+#   columns with only Male and Female Recombination Rate
+
+recsumm$TotalRecombRate <- recsumm$TotalRecombRate * 100
+
+recsumm$Female.RR <- recsumm$TotalRecombCount
+recsumm$Male.RR   <- recsumm$TotalRecombCount
+
+
+recsumm$Female.RR[which(recsumm$RRID.SEX == "Male")] <- NA
+recsumm$Male.RR[which(recsumm$RRID.SEX == "Female")] <- NA
+
+recsumm <- join(recsumm, pedigree)
+
+
+#~~ add mean phenotype information to sheepabel
+
+pheno <- data.frame(MeanRR = tapply(recsumm$TotalRecombCount, recsumm$RRID, mean))
+pheno$id <- row.names(pheno)
+attributes(pheno$Mean) <- NULL
+str(pheno)
+
+sheepabel <- add.phdata(sheepabel, pheno)
+
+#~~ determine individual heteozygosity values
+
+id.summ <- perid.summary(sheepabel)
+id.summ$RRID <- row.names(id.summ)
+
+recsumm <- join(recsumm, id.summ[,c("RRID", "Het")])
+
+# ggplot(recsumm, aes(TotalInfLoci)) + geom_histogram()
+# ggplot(recsumm, aes(TotalInfChrLenIncNonRecombs, TotalInfLoci, col = RRID.SEX)) + geom_point() + stat_smooth(method = "lm")
+# ggplot(recsumm, aes(RRID.Fhat3, AdjR2)) + geom_point()
+
+#~~ determine MAF at SNP loci
+
+maf.info <- summary.snp.data(gtdata(sheepabel))
+head(maf.info)
+
+maf.info$SNP.Name <- row.names(maf.info)
+maf.info <- subset(maf.info, select = c(SNP.Name, CallRate, Q.2))
+names(maf.info)[3] <- "MAF"
+
+#~~ Remove those IDs that didn't pass the simulation R^2 threshold of 0.95
+
+head(simtab)
+simtab <- subset(simtab, AdjR2 >= 0.95)
+
+rectab <- droplevels(subset(rectab, UniqueID2 %in% simtab$UniqueID2))
+recsumm <- droplevels(subset(recsumm, UniqueID2 %in% simtab$UniqueID2))
+
+recsumm <- join(recsumm, simtab)
+
+
+
+write.table(rectab, "results/2_IndivRR_FullCleanPostSim_g.txt", row.names = F, sep = "\t", quote = F)
+write.table(recsumm, "results/2_TotalSummIndivRR_FullCleanPostSim_g.txt", row.names = F, sep = "\t", quote = F)
+
+#~~ Get a list of analysis f ids
+
+ids.f <- read.table("gcta/idlist.txt")[,2]
+
+
+memory.limit(size = 800000000) #ESSENTIAL OTHERWISE YOU RUN INTO MEMORY ISSUES
+
+ainv <- asreml.Ainverse(pedigree)$ginv
+
+recsumm.m <- droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),])
+recsumm.f <- droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),])
+
+```
+
+#### 0. Data Structure:
+
+Number        | Males         | Females     |   All
+------------- | ------------- | ------------| ----------
+Observations  | ```r table(recsumm$RRID.SEX)[["Male"]]```  | ```r table(recsumm$RRID.SEX)[["Female"]]``` | ```r nrow(recsumm)```
+Individuals   | ```r length(unique(subset(recsumm, RRID.SEX == "Male")$RRID))```  | ```r length(unique(subset(recsumm, RRID.SEX == "Female")$RRID))``` | ```r length(unique(recsumm$RRID))```
+Total Number of Crossovers| ```r sum(subset(recsumm, RRID.SEX == "Male"  )$TotalRecombCount)``` | ```r sum(subset(recsumm, RRID.SEX == "Female")$TotalRecombCount)``` | ```r sum(recsumm$TotalRecombCount)```
+
+#### 1. Recombination Information
+
+```{r echo = F}
+
+ggplot(recsumm, aes(TotalRecombCount)) + 
+  geom_histogram(binwidth = 1, col = "black", fill = "darkgrey") + 
+  theme_bw() +
+  labs(x = "Crossover Count per Gamete", y = "Frequency") +
+  theme(axis.text.x  = element_text (size = 14),
+        axis.text.y  = element_text (size = 12),
+        #strip.text.x = element_text (size = 14, vjust = 0.7),
+        axis.title.y = element_text (size = 16, angle = 90, vjust = 1.5),
+        axis.title.x = element_text (size = 16, vjust = 0.2)) +
+  scale_fill_brewer(palette = "Set1")
+
+ggplot(recsumm, aes(TotalRecombCount, fill = RRID.SEX)) + 
+  geom_histogram(binwidth = 1, col = "black") + 
+  theme_bw() +
+  labs(x = "Crossover Count per Gamete", y = "Frequency") +
+  theme(axis.text.x  = element_text (size = 14),
+        axis.text.y  = element_text (size = 12),
+        #strip.text.x = element_text (size = 14, vjust = 0.7),
+        axis.title.y = element_text (size = 16, angle = 90, vjust = 1.5),
+        axis.title.x = element_text (size = 16, vjust = 0.2)) +
+  scale_fill_brewer(palette = "Set1") +
+  facet_wrap(~RRID.SEX, ncol = 1)
+
+
+library(dplyr)
+newrecsumm <- select(recsumm, RRID.CAPAGE, TotalRecombCount, RRID.SEX)
+head(newrecsumm)
+newrecsumm <- filter(newrecsumm, RRID.CAPAGE != 0)
+newrecsumm$RRID.CAPAGE <- as.numeric(as.character(newrecsumm$RRID.CAPAGE))
+newrecsumm$RRID.CAPAGE[which(newrecsumm$RRID.CAPAGE > 9)] <- 9
+newrecsumm$RRID.CAPAGE2 <- newrecsumm$RRID.CAPAGE
+newrecsumm$RRID.CAPAGE2[which(newrecsumm$RRID.SEX == "Female")] <- newrecsumm$RRID.CAPAGE2[which(newrecsumm$RRID.SEX == "Female")] + 0.2
+
+
+multiplot(
+
+ggplot(recsumm, aes(RRID.SEX, TotalRecombCount, fill = RRID.SEX)) + 
+  geom_boxplot(notch = T, width = 0.5)+ 
+  theme_bw() +
+  labs(x = "Sex", y = "Crossover Count per Gamete") +
+  theme(axis.text.x  = element_text (size = 14),
+        axis.text.y  = element_text (size = 12),
+        #strip.text.x = element_text (size = 14, vjust = 0.7),
+        axis.title.y = element_text (size = 16, angle = 90, vjust = 1.5),
+        axis.title.x = element_text (size = 16, vjust = 0.2),
+        legend.position = "top") +
+  scale_fill_brewer(palette = "Set1")
+,
+
+ggplot(newrecsumm, aes(RRID.CAPAGE2, TotalRecombCount, col = RRID.SEX)) + 
+  #geom_boxplot(notch = T, width = 0.8) +
+  geom_point(alpha = 0.3)+
+  theme_bw() +
+  scale_colour_brewer(palette = "Set1") +
+  #facet_wrap(~RRID.SEX) +
+  labs(x = "Age", y = "Crossover Count per Gamete", col = "") +
+  theme(axis.text.x  = element_text (size = 14),
+        axis.text.y  = element_text (size = 14),
+        strip.text.x = element_text (size = 14, vjust = 0.7),
+        axis.title.y = element_text (size = 16, angle = 90, vjust = 1.5),
+        axis.title.x = element_text (size = 16, vjust = 0.2),
+        legend.position = "top") +
+  scale_fill_brewer(palette = "Set1") +
+  stat_smooth(method = "lm")
+, cols = 2, layout = matrix(c(1,1,2,2,2), ncol  = 5, byrow = TRUE))
+
+
+
+```
+
+
+
+#### 2. Estimates of the heritability of recombination rate.
+
+##### 2.1 Genomic heritability
+
+We determined the heritability of total recombination rate using genomic relatedness information to capture the additive genetic variance.
+
+```{r echo = F, message = F}
+
+load("gcta/Autosomes_GRM.Rdata")
+
+# ALL IDS
+grminv <- makeGRM(grm.auto, ids.auto, recsumm$RRID)
+
+grm.summ.RR <- asreml(fixed = TotalRecombCount ~ RRID.SEX + RRID.Fhat3,
+                      random = ~ giv(RRID) + ide(RRID),
+                      data = recsumm,
+                      ginverse =  list(RRID = grminv),
+                      na.method.X = "omit", na.omit.Y = "na.omit",
+                      workspace = 500e+6, pworkspace = 500e+6, trace=F)
+
+grm.summ.RR.x <- asreml(fixed = TotalRecombCount ~ RRID.SEX + RRID.Fhat3,
+                        random = ~ giv(RRID) + ide(RRID),
+                        data = recsumm,
+                        ginverse =  list(RRID = grminv),
+                        rcov = ~idv(units),
+                        na.method.X = "omit", na.omit.Y = "na.omit",
+                        workspace = 500e+6, pworkspace = 500e+6, trace=F)
+
+grm.summ.RR.wogiv <- asreml(fixed = TotalRecombCount ~ RRID.SEX + RRID.Fhat3,
+                            random = ~ ide(RRID),
+                            data = recsumm,
+                            ginverse =  list(RRID = ainv),
+                            na.method.X = "omit", na.omit.Y = "na.omit",
+                            workspace = 500e+6, pworkspace = 500e+6, trace=F)
+```
+
+All sheep:
+
+```{r}
+
+summary(grm.summ.RR, all = T)$coef.fixed
+ASReml.EstEffects(grm.summ.RR)
+wald.asreml(grm.summ.RR)
+pin(grm.summ.RR.x, phen.var ~ V1 + V2 + V4)
+1 - pchisq(2*(summary(grm.summ.RR)$loglik - summary(grm.summ.RR.wogiv)$loglik), df = 1)
+
+
+```
+
+In this case, the heritability is ```r ASReml.EstEffects(grm.summ.RR)["giv(RRID).giv", "Effect"]``` (SE = ```r ASReml.EstEffects(grm.summ.RR)["giv(RRID).giv", "SE"]```, P = ```r 1 - pchisq(2*(summary(grm.summ.RR)$loglik - summary(grm.summ.RR.wogiv)$loglik), df = 1)```), with residual effects explaining the majority of phenotypic variance (r<sup>2</sup> = ```r ASReml.EstEffects(grm.summ.RR)["R!variance", "Effect"]```, SE = ```r ASReml.EstEffects(grm.summ.RR)["R!variance", "SE"]```).
+
+
+```{r echo = F}
+
+# MALES ONLY
+grminv <- makeGRM(grm.auto, ids.auto, recsumm.m$RRID)
+
+grm.summ.RR.males <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                            random = ~ giv(RRID) + ide(RRID),
+                            data = droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),]),
+                            ginverse =  list(RRID = grminv),
+                            na.method.X = "omit", na.omit.Y = "na.omit",
+                            workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+grm.summ.RR.males.x <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                              random = ~ giv(RRID) + ide(RRID),
+                              data = droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),]),
+                              ginverse =  list(RRID = grminv),
+                              rcov = ~idv(units),
+                              na.method.X = "omit", na.omit.Y = "na.omit",
+                              workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+grm.summ.RR.males.wogiv <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                                  random = ~ ide(RRID),
+                                  data = droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),]),
+                                  ginverse =  list(RRID = ainv),
+                                  na.method.X = "omit", na.omit.Y = "na.omit",
+                                  workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+
+# FEMALES ONLY
+grminv <- makeGRM(grm.auto, ids.auto, recsumm.f$RRID)
+
+grm.summ.RR.females <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                              random = ~ giv(RRID) + ide(RRID),
+                              data = droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),]),
+                              ginverse =  list(RRID = grminv),
+                              na.method.X = "omit", na.omit.Y = "na.omit",
+                              workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+grm.summ.RR.females.x <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                                random = ~ giv(RRID) + ide(RRID),
+                                data = droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),]),
+                                ginverse =  list(RRID = grminv),
+                                rcov = ~idv(units),
+                                na.method.X = "omit", na.omit.Y = "na.omit",
+                                workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+grm.summ.RR.females.wogiv <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                                    random = ~ ide(RRID),
+                                    data = droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),]),
+                                    ginverse =  list(RRID = ainv),
+                                    na.method.X = "omit", na.omit.Y = "na.omit",
+                                    workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+
+
+```
+
+Males only:
+```{r}
+summary(grm.summ.RR.males, all = T)$coef.fixed
+wald.asreml(grm.summ.RR.males)
+ASReml.EstEffects(grm.summ.RR.males)
+pin(grm.summ.RR.males.x, phen.var ~ V1 + V2 + V4)
+
+# P-value for heritability:
+1 - pchisq(2*(summary(grm.summ.RR.males)$loglik - summary(grm.summ.RR.males.wogiv)$loglik), df = 1)
+```
+
+Females only:
+```{r}
+summary(grm.summ.RR.females, all = T)$coef.fixed
+wald.asreml(grm.summ.RR.females)
+ASReml.EstEffects(grm.summ.RR.females)
+pin(grm.summ.RR.females.x, phen.var ~ V1 + V2 + V4)
+
+# P-value for heritability:
+1 - pchisq(2*(summary(grm.summ.RR.females)$loglik - summary(grm.summ.RR.females.wogiv)$loglik), df = 1)
+```
+
+
+```{r echo = F}
+
+##### 2.2. Bivariate model of heritability in males and females:
+
+
+grminv <- makeGRM(grm.auto, ids.auto, recsumm$RRID)
+
+cross.sex.RR.grm.3 <- asreml(fixed  = cbind(Female.RR, Male.RR) ~ trait + trait:RRID.Fhat3, 
+                             random = ~ corgh(trait, init = c(0.5, 1, 1)):giv(RRID)
+                             + idh(trait):ide(RRID),
+                             rcov   = ~ units:idh(trait, init = NA),
+                             data = recsumm,
+                             ginverse = list(RRID = grminv),
+                             workspace = 500e+6, pworkspace = 500e+6,
+                             maxiter = 100)
+
+#~~ Constrain rA to be zero
+
+
+
+cross.sex.RR.grm.3.r0 <- asreml(fixed     = cbind(Female.RR, Male.RR) ~ trait+ trait:RRID.Fhat3, 
+                                random    = ~ idh(trait):giv(RRID) + idh(trait):ide(RRID),
+                                rcov      = ~ units:idh(trait, init = NA),
+                                data      = recsumm,
+                                ginverse  = list(RRID = grminv),
+                                workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+
+#~~ Constrain rA to be one (or very close to one)
+
+
+myinit.1        <- c(0.99999, 1, 1)
+names(myinit.1) <- c("F", "P", "P")
+
+cross.sex.RR.grm.3.r1 <- asreml(fixed     = cbind(Female.RR, Male.RR) ~ trait+ trait:RRID.Fhat3, 
+                                random    = ~ corgh(trait, init = myinit.1):giv(RRID) + idh(trait):ide(RRID),
+                                rcov      = ~ units:idh(trait, init = NA),
+                                data      = recsumm,
+                                ginverse  = list(RRID = grminv),
+                                workspace = 500e+6, pworkspace = 500e+6)
+
+
+
+#~~ Constrain variances to be the same, estaimate rA
+
+
+cross.sex.RR.grm.3.cons <- asreml(fixed     = cbind(Female.RR, Male.RR) ~ trait+ trait:RRID.Fhat3, 
+                                random    = ~ corgv(trait):giv(RRID) + idh(trait):ide(RRID),
+                                rcov      = ~ units:idh(trait, init = NA),
+                                data      = recsumm,
+                                ginverse  = list(RRID = grminv),
+                                G.param=cross.sex.RR.grm.3$G.param,
+                                R.param=cross.sex.RR.grm.3$R.param,
+                                workspace = 500e+6, pworkspace = 500e+6)
+
+
+
+
+
+#~~ Constrain variances to be the same and rA =1
+
+cross.sex.RR.grm.3.cons.r1 <- asreml(fixed     = cbind(Female.RR, Male.RR) ~ trait+ trait:RRID.Fhat3, 
+                                random    = ~ giv(RRID, var=T) + idh(trait):ide(RRID),
+                                rcov      = ~ units:idh(trait, init = NA),
+                                data      = recsumm,
+                                ginverse  = list(RRID = grminv),
+                                workspace = 500e+6, pworkspace = 500e+6)
+
+#~~ Constrain variances to be the same and rA =0
+
+cross.sex.RR.grm.3.cons.r0 <- asreml(fixed     = cbind(Female.RR, Male.RR) ~ trait+ trait:RRID.Fhat3, 
+                                random    = ~ idv(trait):giv(RRID) + idh(trait):ide(RRID),
+                                rcov      = ~ units:idh(trait, init = NA),
+                                data      = recsumm,
+                                ginverse  = list(RRID = grminv),
+                                workspace = 500e+6, pworkspace = 500e+6)
+
+
+
+```
+
+```{r}
+#~~ Summary shows the additive genetic correlation in the first row, individual variances in rest of rows:
+
+heritability.results <- list()
+
+heritability.results[["bivar.fixef"]] <- summary(cross.sex.RR.grm.3, all = T)$coef.fixed
+heritability.results[["bivar.ranef"]] <- summary(cross.sex.RR.grm.3)$varcomp
+
+# Significantly different from zero?
+heritability.results[["bivar.sig.diff.from.zero"]] <- 1 - pchisq(2*(summary(cross.sex.RR.grm.3)$loglik - summary(cross.sex.RR.grm.3.r0)$loglik), df = 1)
+
+# Significantly different from one?
+heritability.results[["bivar.sig.diff.from.one"]] <- 1 - pchisq(2*(summary(cross.sex.RR.grm.3)$loglik - summary(cross.sex.RR.grm.3.r1)$loglik), df = 1)
+
+# Significantly different additive genetic variance?
+heritability.results[["bivar.sig.diff.Va"]] <- 1 - pchisq(2*(summary(cross.sex.RR.grm.3)$loglik - summary(cross.sex.RR.grm.3.cons)$loglik), df = 1)
+
+# # Significantly different residual variance?
+# heritability.results[["bivar.sig.diff.Vr"]] <- 1 - pchisq(2*(summary(cross.sex.RR.grm.3)$loglik - summary(cross.sex.RR.grm.3.cons2)$loglik), df = 1)
+
+
+
+```
+
+```{r echo = F}
+
+# make the table
+
+grm.fixef <- data.frame(rbind(cbind(Analysis = "All sheep",
+                                    summary(grm.summ.RR, all = T)$coef.fixed,
+                                    EffectName = row.names(summary(grm.summ.RR, all = T)$coef.fixed)),
+                              cbind(Analysis = "Male sheep",
+                                    summary(grm.summ.RR.males, all = T)$coef.fixed,
+                                    EffectName = row.names(summary(grm.summ.RR.males, all = T)$coef.fixed)),
+                              cbind(Analysis = "Female sheep",
+                                    summary(grm.summ.RR.females, all = T)$coef.fixed,
+                                    EffectName = row.names(summary(grm.summ.RR.females, all = T)$coef.fixed))))
+
+
+grm.wald <- data.frame(rbind(cbind(Analysis = "All sheep",
+                                   data.frame(wald.asreml(grm.summ.RR)),
+                                   EffectName = row.names(data.frame(wald.asreml(grm.summ.RR)))),
+                             cbind(Analysis = "Male sheep",
+                                   data.frame(wald.asreml(grm.summ.RR.males)),
+                                   EffectName = row.names(data.frame(wald.asreml(grm.summ.RR.males)))),
+                             cbind(Analysis = "Female sheep",
+                                   data.frame(wald.asreml(grm.summ.RR.females)),
+                                   EffectName = row.names(data.frame(wald.asreml(grm.summ.RR.females))))))
+
+
+grm.fixef <- join(grm.fixef, grm.wald)
+
+grm.ranef <- data.frame(rbind(cbind(Analysis = "All Sheep",
+                                    ASReml.EstEffects(grm.summ.RR),
+                                    EffectName = row.names(ASReml.EstEffects(grm.summ.RR))),
+                              cbind(Analysis = "Male Sheep",
+                                    ASReml.EstEffects(grm.summ.RR.males),
+                                    EffectName = row.names(ASReml.EstEffects(grm.summ.RR.males))),
+                              cbind(Analysis = "Female Sheep",
+                                    ASReml.EstEffects(grm.summ.RR.females),
+                                    EffectName = row.names(ASReml.EstEffects(grm.summ.RR.females)))))
+
+
+
+grm.ranef$Effect.SE <- paste0(signif(grm.ranef$Effect, digits = 3), " (", signif(grm.ranef$SE, digits = 2), ")")
+grm.ranef <- subset(grm.ranef, select = -c(gamma, component, std.error, constraint, z.ratio, Effect, SE))
+
+
+grm.ranef <- cast(grm.ranef, Analysis ~ EffectName)
+grm.ranef <- grm.ranef[c(1, 3, 2),]
+
+
+
+vobs <- data.frame(cbind(rbind(round(pin(grm.summ.RR.x, Vp ~ V1 + V2 + V4), digits = 3),
+                               round(pin(grm.summ.RR.males.x, Vp ~ V1 + V2 + V4), digits = 3),
+                               round(pin(grm.summ.RR.females.x, Vp ~ V1 + V2 + V4), digits = 3)),
+                         Vobs = round(c(var(recsumm$TotalRecombCount, na.rm = T),
+                                        var(recsumm$Male.RR, na.rm = T),
+                                        var(recsumm$Female.RR, na.rm = T)), digits = 3),
+                         Meanobs = round(c(mean(recsumm$TotalRecombCount, na.rm = T),
+                                           mean(recsumm$Male.RR, na.rm = T),
+                                           mean(recsumm$Female.RR, na.rm = T)), digits = 3),
+                         Meanobs.se = round(c(std(recsumm$TotalRecombCount),
+                                              std(recsumm$Male.RR),
+                                              std(recsumm$Female.RR)), digits = 3)))
+
+
+grm.ranef$Vp <- paste0(vobs$Estimate, " (", vobs$SE, ")")
+grm.ranef$Vobs <- vobs$Vobs
+grm.ranef$Mean <- paste0(vobs$Meanobs, " (", vobs$Meanobs.se, ")")
+
+
+grm.ranef$Nids <- c(nrow(recsumm), nrow(subset(recsumm, RRID.SEX == "Male")), nrow(subset(recsumm, RRID.SEX == "Female")))
+grm.ranef$Nobs <- c(length(unique(recsumm$RRID)), length(unique(subset(recsumm, RRID.SEX == "Male")$RRID)), length(unique(subset(recsumm, RRID.SEX == "Female")$RRID)))
+grm.ranef$Nxovers <- c(sum(recsumm$TotalRecombCount), sum(subset(recsumm, RRID.SEX == "Male"  )$TotalRecombCount), sum(subset(recsumm, RRID.SEX == "Female")$TotalRecombCount))
+
+grm.ranef$h2sig <- c(1 - pchisq(2*(summary(grm.summ.RR)$loglik - summary(grm.summ.RR.wogiv)$loglik), df = 1),
+                     1 - pchisq(2*(summary(grm.summ.RR.males)$loglik - summary(grm.summ.RR.males.wogiv)$loglik), df = 1),
+                     1 - pchisq(2*(summary(grm.summ.RR.females)$loglik - summary(grm.summ.RR.females.wogiv)$loglik), df = 1))
+
+dput(names(grm.ranef))
+
+grm.fixef 
+grm.ranef <- grm.ranef[,c("Analysis", "Nids", "Nobs", "Vobs", "Mean", "Nxovers", "Vp",  "giv(RRID).giv", "h2sig", "ide(RRID)!id", "R!variance")]
+grm.ranef
+
+rm(grm.summ.RR.females.wogiv, grm.summ.RR.males.wogiv, grm.summ.RR.wogiv,
+   grm.summ.RR.females.x, grm.summ.RR.males.x, grm.summ.RR.x,
+   cross.sex.RR.grm.3.r0, cross.sex.RR.grm.3.r1)
+gc()
+
+heritability.results[["grm.fixef"]] <- grm.fixef
+heritability.results[["grm.ranef"]] <- grm.ranef
+
+
+save(heritability.results, file = "results/2_GRMheritability_results_for_paper.txt")
+
+
+```
+
+
+##### 2.3 Estimates of the heritability of recombination rate with pedigree information.
+
+We determined the heritability of total recombination rate using genomic relatedness information to capture the additive genetic variance.
+
+```{r echo = F, message = F}
+# ALL IDS
+pedinv <- ainv
+
+ped.summ.RR <- asreml(fixed = TotalRecombCount ~ RRID.SEX + RRID.Fhat3,
+                      random = ~ ped(RRID) + ide(RRID),
+                      data = recsumm,
+                      ginverse =  list(RRID = pedinv),
+                      na.method.X = "omit", na.omit.Y = "na.omit",
+                      workspace = 500e+6, pworkspace = 500e+6, trace=T)
+
+ped.summ.RR.x <- asreml(fixed = TotalRecombCount ~ RRID.SEX + RRID.Fhat3,
+                        random = ~ ped(RRID) + ide(RRID),
+                        data = recsumm,
+                        ginverse =  list(RRID = pedinv),
+                        rcov = ~idv(units),
+                        na.method.X = "omit", na.omit.Y = "na.omit", maxiter = 30,
+                        workspace = 500e+6, pworkspace = 500e+6, trace=T)
+
+ped.summ.RR.woped <- asreml(fixed = TotalRecombCount ~ RRID.SEX + RRID.Fhat3,
+                            random = ~ ide(RRID),
+                            data = recsumm,
+                            ginverse =  list(RRID = ainv),
+                            na.method.X = "omit", na.omit.Y = "na.omit",
+                            workspace = 500e+6, pworkspace = 500e+6, trace=F)
+```
+
+All sheep:
+
+```{r}
+
+summary(ped.summ.RR, all = T)$coef.fixed
+wald.asreml(ped.summ.RR)
+ASReml.EstEffects(ped.summ.RR)
+
+```
+
+
+
+```{r echo = F}
+
+# MALES ONLY
+
+ped.summ.RR.males <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                            random = ~ ped(RRID) + ide(RRID),
+                            data = droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),]),
+                            ginverse =  list(RRID = pedinv),
+                            na.method.X = "omit", na.omit.Y = "na.omit",
+                            workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+ped.summ.RR.males.x <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                              random = ~ ped(RRID) + ide(RRID),
+                              data = droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),]),
+                              ginverse =  list(RRID = pedinv),
+                              rcov = ~idv(units),
+                              na.method.X = "omit", na.omit.Y = "na.omit", maxiter = 30,
+                              workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+
+ped.summ.RR.males.woped <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                                  random = ~ ide(RRID),
+                                  data = droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),]),
+                                  ginverse =  list(RRID = ainv),
+                                  na.method.X = "omit", na.omit.Y = "na.omit",
+                                  workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+
+# FEMALES ONLY
+
+ped.summ.RR.females <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                              random = ~ ped(RRID) + ide(RRID),
+                              data = droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),]),
+                              ginverse =  list(RRID = pedinv),
+                              na.method.X = "omit", na.omit.Y = "na.omit",
+                              workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+ped.summ.RR.females.x <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                                random = ~ ped(RRID) + ide(RRID),
+                                data = droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),]),
+                                ginverse =  list(RRID = pedinv),
+                                rcov = ~idv(units),
+                                na.method.X = "omit", na.omit.Y = "na.omit",
+                                workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+ped.summ.RR.females.woped <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                                    random = ~ ide(RRID),
+                                    data = droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),]),
+                                    ginverse =  list(RRID = ainv),
+                                    na.method.X = "omit", na.omit.Y = "na.omit",
+                                    workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+
+
+```
+
+Males only:
+```{r}
+summary(ped.summ.RR.males, all = T)$coef.fixed
+wald.asreml(ped.summ.RR.males)
+
+ASReml.EstEffects(ped.summ.RR.males)
+
+# P-value for heritability:
+1 - pchisq(2*(summary(ped.summ.RR.males)$loglik - summary(ped.summ.RR.males.woped)$loglik), df = 1)
+```
+
+Females only:
+```{r}
+summary(ped.summ.RR.females, all = T)$coef.fixed
+wald.asreml(ped.summ.RR.females)
+
+ASReml.EstEffects(ped.summ.RR.females)
+
+# P-value for heritability:
+1 - pchisq(2*(summary(ped.summ.RR.females)$loglik - summary(ped.summ.RR.females.woped)$loglik), df = 1)
+
+```
+
+##### 2.4 Bivariate model of heritability in males and females:
+
+```{r echo = F}
+
+
+cross.sex.RR.ped.3 <- asreml(fixed  = cbind(Female.RR, Male.RR) ~ trait + RRID.Fhat3, 
+                             random = ~ corgh(trait, init = c(0.5, 1, 1 )):ped(RRID) + ide(RRID),
+                             rcov   = ~ units:idh(trait, init = NA),
+                             data = recsumm,
+                             ginverse = list(RRID = pedinv),
+                             workspace = 500e+6, pworkspace = 500e+6,
+                             maxiter = 100, trace = F)
+
+
+myinit.0        <- c(0, 1, 1)
+names(myinit.0) <- c("F", "P", "P")
+
+cross.sex.RR.ped.3.r0 <- asreml(fixed     = cbind(Female.RR, Male.RR) ~ trait+ RRID.Fhat3, 
+                                random    = ~ corgh(trait, init = myinit.0):ped(RRID) + ide(RRID),
+                                rcov      = ~ units:idh(trait, init = NA),
+                                data      = recsumm,
+                                ginverse  = list(RRID = pedinv),
+                                workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+
+
+myinit.1        <- c(0.99999, 1, 1)
+names(myinit.1) <- c("F", "P", "P")
+
+cross.sex.RR.ped.3.r1.ped <- asreml(fixed     = cbind(Female.RR, Male.RR) ~ trait+ RRID.Fhat3, 
+                                    random    = ~ corgh(trait, init = myinit.1):ped(RRID) + ide(RRID),
+                                    rcov      = ~ units:idh(trait, init = NA),
+                                    data      = recsumm,
+                                    ginverse  = list(RRID = pedinv),
+                                    workspace = 500e+6, pworkspace = 500e+6, trace = F)
+
+
+
+```
+
+```{r echo = F}
+
+# make the table
+
+ped.fixef <- data.frame(rbind(cbind(Analysis = "All sheep",
+                                    summary(ped.summ.RR, all = T)$coef.fixed,
+                                    EffectName = row.names(summary(ped.summ.RR, all = T)$coef.fixed)),
+                              cbind(Analysis = "Male sheep",
+                                    summary(ped.summ.RR.males, all = T)$coef.fixed,
+                                    EffectName = row.names(summary(ped.summ.RR.males, all = T)$coef.fixed)),
+                              cbind(Analysis = "Female sheep",
+                                    summary(ped.summ.RR.females, all = T)$coef.fixed,
+                                    EffectName = row.names(summary(ped.summ.RR.females, all = T)$coef.fixed))))
+
+
+ped.wald <- data.frame(rbind(cbind(Analysis = "All sheep",
+                                   data.frame(wald.asreml(ped.summ.RR)),
+                                   EffectName = row.names(data.frame(wald.asreml(ped.summ.RR)))),
+                             cbind(Analysis = "Male sheep",
+                                   data.frame(wald.asreml(ped.summ.RR.males)),
+                                   EffectName = row.names(data.frame(wald.asreml(ped.summ.RR.males)))),
+                             cbind(Analysis = "Female sheep",
+                                   data.frame(wald.asreml(ped.summ.RR.females)),
+                                   EffectName = row.names(data.frame(wald.asreml(ped.summ.RR.females))))))
+
+
+ped.fixef <- join(ped.fixef, ped.wald)
+
+ped.ranef <- data.frame(rbind(cbind(Analysis = "All Sheep",
+                                    ASReml.EstEffects(ped.summ.RR),
+                                    EffectName = row.names(ASReml.EstEffects(ped.summ.RR))),
+                              cbind(Analysis = "Male Sheep",
+                                    ASReml.EstEffects(ped.summ.RR.males),
+                                    EffectName = row.names(ASReml.EstEffects(ped.summ.RR.males))),
+                              cbind(Analysis = "Female Sheep",
+                                    ASReml.EstEffects(ped.summ.RR.females),
+                                    EffectName = row.names(ASReml.EstEffects(ped.summ.RR.females)))))
+
+
+
+ped.ranef$Effect.SE <- paste0(signif(ped.ranef$Effect, digits = 3), " (", signif(ped.ranef$SE, digits = 2), ")")
+ped.ranef <- subset(ped.ranef, select = -c(gamma, component, std.error, constraint, z.ratio, Effect, SE))
+
+
+ped.ranef <- cast(ped.ranef, Analysis ~ EffectName)
+ped.ranef <- ped.ranef[c(1, 3, 2),]
+
+
+vobs <- data.frame(cbind(rbind(round(pin(ped.summ.RR.x, Vp ~ V1 + V2 + V4), digits = 3),
+                               round(pin(ped.summ.RR.males.x, Vp ~ V1 + V2 + V4), digits = 3),
+                               round(pin(ped.summ.RR.females.x, Vp ~ V1 + V2 + V4), digits = 3)),
+                         Vobs = round(c(var(recsumm$TotalRecombCount, na.rm = T),
+                                        var(recsumm$Male.RR, na.rm = T),
+                                        var(recsumm$Female.RR, na.rm = T)), digits = 3),
+                         Meanobs = round(c(mean(recsumm$TotalRecombCount, na.rm = T),
+                                           mean(recsumm$Male.RR, na.rm = T),
+                                           mean(recsumm$Female.RR, na.rm = T)), digits = 3),
+                         Meanobs.se = round(c(std(recsumm$TotalRecombCount),
+                                              std(recsumm$Male.RR),
+                                              std(recsumm$Female.RR)), digits = 3)))
+
+
+ped.ranef$Vp <- paste0(vobs$Estimate, " (", vobs$SE, ")")
+ped.ranef$Vobs <- vobs$Vobs
+ped.ranef$Mean <- paste0(vobs$Meanobs, " (", vobs$Meanobs.se, ")")
+
+
+ped.ranef$Nids <- c(nrow(recsumm), nrow(subset(recsumm, RRID.SEX == "Male")), nrow(subset(recsumm, RRID.SEX == "Female")))
+ped.ranef$Nobs <- c(length(unique(recsumm$RRID)), length(unique(subset(recsumm, RRID.SEX == "Male")$RRID)), length(unique(subset(recsumm, RRID.SEX == "Female")$RRID)))
+ped.ranef$Nxovers <- c(sum(recsumm$TotalRecombCount), sum(subset(recsumm, RRID.SEX == "Male"  )$TotalRecombCount), sum(subset(recsumm, RRID.SEX == "Female")$TotalRecombCount))
+
+ped.ranef$h2sig <- c(1 - pchisq(2*(summary(ped.summ.RR)$loglik - summary(ped.summ.RR.woped)$loglik), df = 1),
+                     1 - pchisq(2*(summary(ped.summ.RR.males)$loglik - summary(ped.summ.RR.males.woped)$loglik), df = 1),
+                     1 - pchisq(2*(summary(ped.summ.RR.females)$loglik - summary(ped.summ.RR.females.woped)$loglik), df = 1))
+
+dput(names(ped.ranef))
+
+ped.fixef 
+ped.ranef <- ped.ranef[,c("Analysis", "Nids", "Nobs", "Vobs", "Mean", "Nxovers", "Vp",  "ped(RRID)!ped", "h2sig", "ide(RRID)!id", "R!variance")]
+ped.ranef
+
+rm(ped.summ.RR.females.woped, ped.summ.RR.males.woped, ped.summ.RR.woped,
+   ped.summ.RR.females.x, ped.summ.RR.males.x, ped.summ.RR.x,
+   cross.sex.RR.ped.3.r0, cross.sex.RR.ped.3.r1)
+gc()
+```
+
+```{r echo = F, results = "hide"}
+names(ped.ranef)[which(names(ped.ranef) == "ped(RRID)!ped")] <- "Heritability"
+names(grm.ranef)[which(names(grm.ranef) == "giv(RRID).giv")] <- "Heritability"
+
+all.ranef <- rbind(ped.ranef, grm.ranef)
+all.ranef <- cbind(Matrix = rep(c("Pedigree", "Genomic"), each = 3), all.ranef)
+
+write.table(all.ranef, "results/2_GRMvPed_ModelTableForLaTeX.txt", row.names = F, quote = F, sep = " & ")
+
+```
+
+
+### 4. Genome-wide Association Study for Global Recombination Rate: Total Recombination Rate (Cis- and trans-effects)
+
+
+Here, we conduct a raw GWAS which should incorporate regions of the genome affection recombination in *cis* (i.e. on the same chromosome) and in *trans* (i.e. on other chromosomes). We conduct a GWAS using the GRAMMAR method (i.e. using residuals only).
+
+Model structure - ```qtscore(MeanRR ~ sex, data = sheepabel)```
+
+#### GRAMMAR method using genomic relatedness
+
+All sheep:
+
+```{r fig.width = 10, echo = F, warning = F}
+Pthresh <- 0.05/22273.61
+
+grammar_cistrans <- NULL
+
+
+grmRRvals <- extractPredictors(grm.summ.RR, recsumm$RRID, idvar = "RRID")
+names(grmRRvals)[1] <- "id"
+write.table(grmRRvals, "results/2_predictors_grm.summ.RR.txt", row.names = F, sep = "\t", quote = F)
+
+sheepabel2 <- add.phdata(sheepabel, grmRRvals)
+gwaa.resid <- qtscore(Resid.Mean ~ sex, data = sheepabel2)
+multiplot(FullGwasPlot(CumuPos(gwaa.resid), corrected = T,bonf = Pthresh),
+          FullPpPlot(gwaa.resid, CumuPos(gwaa.resid), corrected = T), cols = 2, layout = matrix(c(1, 1, 2), nrow=1, byrow=T))
+lambda(gwaa.resid)
+gwaa.results <- results(gwaa.resid)
+gwaa.results$SNP.Name <- row.names(gwaa.results)
+gwaa.results <- join(gwaa.results, maf.info)
+arrange(gwaa.results, Pc1df)[1:10,]
+FullGwasPlot(CumuPos(gwaa.resid), corrected = T,bonf = Pthresh)
+
+grammar_cistrans <- rbind(grammar_cistrans, cbind(Analysis = "BothSexes", gwaa.results))
+
+
+```
+
+Male sheep:
+
+```{r fig.width = 10, echo = F, warning = F}
+# Males Only:
+
+grmRRvals.male <- extractPredictors(grm.summ.RR.males, recsumm.m$RRID, idvar = "RRID")
+names(grmRRvals.male)[1] <- "id"
+write.table(grmRRvals.male, "results/2_predictors_grm.summ.RR.males.txt", row.names = F, sep = "\t", quote = F)
+
+sheepabel2 <- add.phdata(sheepabel, grmRRvals.male)
+gwaa.resid <- qtscore(Resid.Mean, data = sheepabel2)
+lambda(gwaa.resid)
+
+multiplot(FullGwasPlot(CumuPos(gwaa.resid), corrected = T,bonf = Pthresh),
+          FullPpPlot(gwaa.resid, CumuPos(gwaa.resid), corrected = T), cols = 2, layout = matrix(c(1, 1, 2), nrow=1, byrow=T))
+gwaa.results <- results(gwaa.resid)
+gwaa.results$SNP.Name <- row.names(gwaa.results)
+gwaa.results <- join(gwaa.results, maf.info)
+arrange(gwaa.results, Pc1df)[1:10,]
+
+grammar_cistrans <- rbind(grammar_cistrans, cbind(Analysis = "Males", gwaa.results))
+
+```
+
+Female sheep:
+```{r fig.width = 10, echo = F, warning = F}
+# Females Only:
+
+grmRRvals.female <- extractPredictors(grm.summ.RR.females, recsumm.f$RRID, idvar = "RRID")
+names(grmRRvals.female)[1] <- "id"
+write.table(grmRRvals.female, "results/2_predictors_grm.summ.RR.females.txt", row.names = F, sep = "\t", quote = F)
+
+grmRRvals.female <- read.table("results/2_predictors_grm.summ.RR.females.txt", header = T)
+
+sheepabel2 <- add.phdata(sheepabel, grmRRvals.female)
+gwaa.resid <- qtscore(Resid.Mean, data = sheepabel2)
+multiplot(FullGwasPlot(CumuPos(gwaa.resid), corrected = T,bonf = Pthresh),
+          FullPpPlot(gwaa.resid, CumuPos(gwaa.resid), corrected = T), cols = 2, layout = matrix(c(1, 1, 2), nrow=1, byrow=T))
+
+gwaa.results <- results(gwaa.resid)
+gwaa.results$SNP.Name <- row.names(gwaa.results)
+gwaa.results <- join(gwaa.results, maf.info)
+arrange(gwaa.results, Pc1df)[1:10,]
+
+grammar_cistrans <- rbind(grammar_cistrans, cbind(Analysis = "Females", gwaa.results))
+
+
+gwaa.results[which(gwaa.results$Chromosome == 6 & gwaa.results$Position > 116000000),]
+
+# save(grmRRvals, grmRRvals.male, grmRRvals.female, file = "imputation/gwasCisTransResults.Rdata")
+
+write.table(grammar_cistrans, "results/2_GWAS_Results_cistrans.txt", row.names = F, quote = F, sep = "\t")
+
+rm(sheepabel2, gwaa.resid, gwaa.results)
+```
+
+### 4.a. GWAS after accounting for the RNF212 region
+
+```{r echo = F}
+
+haplos <- read.table("results/ThreeBaseHaplotypes.txt", header = T)
+head(haplos)
+haplos <- cast(haplos, ID ~ HaploID)
+haplos$Allele1 <- apply(haplos[,c("Haplo1", "Haplo2")], 1, function (x) sort(x)[1])
+haplos$Allele2 <- apply(haplos[,c("Haplo1", "Haplo2")], 1, function (x) sort(x)[2])
+
+haplos$HaploGeno <- paste(haplos$Allele1, haplos$Allele2, sep = "/")
+names(haplos)[1] <- "RRID"
+
+rnf212geno <- data.frame(RNF212 = unlist(as.character.gwaa.data(sheepabel[,"s74824.1"])),
+                         RNF212.2 = unlist(as.character.gwaa.data(sheepabel[,"s14138.1"])))
+
+rnf212geno$RRID <- row.names(rnf212geno)
+
+recsumm <- join(recsumm, rnf212geno)
+
+recsumm <- join(recsumm, haplos[,c("RRID", "HaploGeno")])
+recsumm$HaploGeno2 <- sapply(recsumm$HaploGeno, function(x) paste(strsplit(x, split = "")[[1]][-c(2, 6)], collapse = ""))
+recsumm$HaploGeno2[which(recsumm$HaploGeno2 %in% c("AA/AA", "AA/GA"))] <- NA
+
+recsumm$HaploGeno2 <- relevel(as.factor(recsumm$HaploGeno2), ref = "GA/GA")
+
+grminv <- makeGRM(grm.auto, ids.auto, recsumm$RRID)
+
+grm.summ.RR.rnf <- asreml(fixed = TotalRecombCount ~ RRID.SEX + factor(s74824.1) + RRID.Fhat3,
+                          random = ~ giv(RRID) + ide(RRID),
+                          data = recsumm,
+                          ginverse =  list(RRID = grminv),
+                          na.method.X = "omit", na.omit.Y = "na.omit",
+                          workspace = 500e+6, pworkspace = 500e+6)
+
+grm.summ.RR.rnf <- asreml(fixed = TotalRecombCount ~ RRID.SEX + factor(HaploGeno2) + RRID.Fhat3,
+                          random = ~ giv(RRID) + ide(RRID),
+                          data = recsumm,
+                          ginverse =  list(RRID = grminv),
+                          na.method.X = "omit", na.omit.Y = "na.omit",
+                          workspace = 500e+6, pworkspace = 500e+6)
+
+
+summary(grm.summ.RR.rnf, all = T)$coef.fixed
+ASReml.EstEffects(grm.summ.RR.rnf)
+
+
+# MALES ONLY
+grminv <- makeGRM(grm.auto, ids.auto, recsumm.m$RRID)
+
+grm.summ.RR.males.rnf <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3 + factor(HaploGeno),
+                                random = ~ giv(RRID) + ide(RRID),
+                                data = droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),]),
+                                ginverse =  list(RRID = grminv),
+                                na.method.X = "omit", na.omit.Y = "na.omit",
+                                workspace = 500e+6, pworkspace = 500e+6)
+
+summary(grm.summ.RR.males.rnf, all = T)$coef.fixed
+ASReml.EstEffects(grm.summ.RR.males.rnf)
+
+# FEMALES ONLY
+grminv <- makeGRM(grm.auto, ids.auto, recsumm.f$RRID)
+
+grm.summ.RR.females.rnf <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3 + factor(HaploGeno), 
+                                  random = ~ giv(RRID) + ide(RRID) + ide(MOTHER),
+                                  data = droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),]),
+                                  ginverse =  list(RRID = grminv, MOTHER = ainv),
+                                  na.method.X = "omit", na.omit.Y = "na.omit", Cfixed = TRUE,
+                                  workspace = 500e+6, pworkspace = 500e+6)
+
+grm.summ.RR.females.rnf$Cfixed
+
+summary(grm.summ.RR.females.rnf, all = T)$coef.fixed
+ASReml.EstEffects(grm.summ.RR.females.rnf)
+
+table(recsumm$s74824.1, recsumm$RRID.SEX)
+
+rnf.cistrans.fixef <- rbind(cbind(summary(grm.summ.RR.rnf, all = T)$coef.fixed, Analysis = "Both Sexes"),
+                            cbind(summary(grm.summ.RR.males.rnf, all = T)$coef.fixed, Analysis = "Males"),
+                            cbind(summary(grm.summ.RR.females.rnf, all = T)$coef.fixed, Analysis = "Females"))
+                            
+rnf.cistrans.ranef <- rbind(cbind(ASReml.EstEffects(grm.summ.RR.rnf)        , Analysis = "Both Sexes"),
+                            cbind(ASReml.EstEffects(grm.summ.RR.males.rnf)  , Analysis = "Males"),
+                            cbind(ASReml.EstEffects(grm.summ.RR.females.rnf), Analysis = "Females"))                            
+
+
+save(rnf.cistrans.fixef, rnf.cistrans.ranef, file = "results/2_rnf_cistransmodels.Rdata")
+
+
+
+fixef.rnf2 <- rbind(cbind(summary(grm.summ.RR.rnf, all = T)$coef.fixed, Sex = "all"),
+                    cbind(summary(grm.summ.RR.males.rnf, all = T)$coef.fixed, Sex = "male"),
+                    cbind(summary(grm.summ.RR.females.rnf, all = T)$coef.fixed, Sex = "female"))
+
+fixef.rnf2 <- fixef.rnf2[grep("s74", row.names(fixef.rnf2)),]
+fixef.rnf2 <- data.frame(fixef.rnf2)
+fixef.rnf2$Genotype <- rep(c("AA", "AG", "GG"), 3)
+
+for(i in 1:3) fixef.rnf2[,i] <- as.numeric(fixef.rnf2[,i])
+```
+
+```{r echo = F}
+fixef.rnf2
+ggplot(recsumm, aes(s74824.1, TotalRecombCount, fill = RRID.SEX)) + 
+  geom_boxplot(notch = T) + 
+  scale_fill_brewer(palette = "Set1") +
+  facet_wrap(~RRID.SEX)
+
+ggplot(fixef.rnf2, aes(Genotype, solution)) + 
+  geom_point() + 
+  geom_errorbar(aes(ymax = solution + std.error, ymin = solution - std.error), width = 0) +
+  facet_wrap(~Sex) +
+  labs(x = "s74824.1 Genotype", y = "Effect size relative to intercept") +
+  defopts
+
+write.table(rnf212geno, "results/rnf212genos.txt", row.names = F, quote = F, sep = "\t")
+
+```
+
+### 5. Genome-wide Association Study for Global Recombination Rate: Recombination Rate minus focal Chr (trans-effects only)
+
+Here, we conduct a GWAS which should incorporate regions of the genome affecting recombination in *trans* only (i.e. on other chromosomes). This is done by examining associations between SNPs and recombination rate across the genome MINUS that particular chromosome. NB. This does not include recombination on the sex chromosomes.
+
+```{r eval = F, message = F, echo = F, warning = F, results = "hide"}
+
+#~~ All sheep together
+
+resultstab <- NULL
+gwastab    <- NULL
+
+grminv <- makeGRM(grm.auto, ids.auto, recsumm$RRID)
+
+
+for(i in 1:26){
+  
+  print(paste("Analysing Chromosome", i, "of 26"))
+  
+  #~~ Subset the data to excluse the focal chromosome
+  
+  abelsub <- sheepabel[,which(chromosome(sheepabel) == i)]
+  
+  temptab <- droplevels(subset(rectab, Chr != i))
+  temprecsumm <- data.frame(RecombCount.wochr = unlist(tapply(temptab$RecombCount.v2, temptab$UniqueID2, sum)),
+                            TotalChromosomeLength = unlist(tapply(as.numeric(temptab$Inf.Chr.Length), temptab$UniqueID2, sum)))
+  temprecsumm$TotalRecombCount.wochr <- (temprecsumm$RecombCount.wochr/temprecsumm$TotalChromosomeLength) * 1000000
+  
+  temprecsumm$UniqueID2 <- row.names(temprecsumm)
+  temprecsumm <- join(temprecsumm, recsumm)
+  
+  #~~ Subset the data further by sex
+  
+  temprecsumm.m <- droplevels(subset(temprecsumm, RRID.SEX == "Male"))
+  temprecsumm.f <- droplevels(subset(temprecsumm, RRID.SEX == "Female"))
+  
+  #~~ Run the animal models
+  
+  tempmod <- asreml(fixed = TotalRecombCount.wochr ~ factor(RRID.SEX) + RRID.Fhat3,
+                    random = ~ giv(RRID) + ide(RRID),
+                    data = temprecsumm,
+                    ginverse =  list(RRID = grminv),
+                    na.method.X = "omit", na.omit.Y = "na.omit",
+                    workspace = 500e+6, pworkspace = 500e+6)
+  
+  
+  tempmod.m <- asreml(fixed = TotalRecombCount.wochr ~ RRID.Fhat3,
+                      random = ~ giv(RRID) + ide(RRID),
+                      data = temprecsumm.m,
+                      ginverse =  list(RRID = grminv),
+                      na.method.X = "omit", na.omit.Y = "na.omit",
+                      workspace = 500e+6, pworkspace = 500e+6)
+  
+  
+  tempmod.f <- asreml(fixed = TotalRecombCount.wochr ~ RRID.Fhat3,
+                      random = ~ giv(RRID) + ide(RRID),
+                      data = temprecsumm.f,
+                      ginverse =  list(RRID = grminv),
+                      na.method.X = "omit", na.omit.Y = "na.omit",
+                      workspace = 500e+6, pworkspace = 500e+6)
+  
+  resultstab <- rbind(resultstab, cbind(ASReml.EstEffects(tempmod  ), Chr = i, Analysis = "all"))
+  resultstab <- rbind(resultstab, cbind(ASReml.EstEffects(tempmod.m), Chr = i, Analysis = "male"))
+  resultstab <- rbind(resultstab, cbind(ASReml.EstEffects(tempmod.f), Chr = i, Analysis = "female"))
+  
+  #~~ Extract the predictors
+  
+  predtab <- extractPredictors(tempmod, idvec = temprecsumm$RRID, "RRID")
+  names(predtab)[which(names(predtab) == "RRID")] <- "id"
+  
+  predtab.m <- extractPredictors(tempmod.m, idvec = temprecsumm.m$RRID, "RRID")
+  names(predtab.m)[which(names(predtab.m) == "RRID")] <- "id"
+  
+  predtab.f <- extractPredictors(tempmod.f, idvec = temprecsumm.f$RRID, "RRID")
+  names(predtab.f)[which(names(predtab.f) == "RRID")] <- "id"
+  
+  # save(predtab, predtab.m, predtab.f, file = "imputation/chr6transdata.Rdata")
+  
+  #~~ GWAS all
+  
+  abelsub2 <- add.phdata(abelsub, predtab)
+  modelabel <-qtscore(Resid.Mean ~ sex, data = abelsub2)
+  gwastab <- rbind(gwastab, cbind(results(modelabel), Analysis = "all"))
+  
+  rm(abelsub2, modelabel)
+  
+  #~~ GWAS male
+  
+  abelsub2 <- add.phdata(abelsub, predtab.m)
+  modelabel <-qtscore(Resid.Mean, data = abelsub2)
+  gwastab <- rbind(gwastab, cbind(results(modelabel), Analysis = "male"))
+  
+  rm(abelsub2, modelabel)
+  
+  #~~ GWAS female
+  
+  abelsub2 <- add.phdata(abelsub, predtab.f)
+  modelabel <-qtscore(Resid.Mean, data = abelsub2)
+  gwastab <- rbind(gwastab, cbind(results(modelabel), Analysis = "female"))
+  
+  rm(abelsub2, modelabel)
+  
+  #~~ Clean up workspace
+  
+  rm(abelsub, abelsub2, predtab, predtab.f, predtab.m, tempmod, tempmod.m, tempmod.f, temprecsumm, modelabel, temptab)
+  
+  }
+
+#~~ Add unmapped and sex chromosomes
+
+predtab <- extractPredictors(grm.summ.RR, idvec = recsumm$RRID, "RRID")
+names(predtab)[which(names(predtab) == "RRID")] <- "id"
+
+predtab.m <- extractPredictors(grm.summ.RR.males, idvec = recsumm.m$RRID, "RRID")
+names(predtab.m)[which(names(predtab.m) == "RRID")] <- "id"
+
+predtab.f <- extractPredictors(grm.summ.RR.females, idvec = recsumm.f$RRID, "RRID")
+names(predtab.f)[which(names(predtab.f) == "RRID")] <- "id"
+
+#~~ GWAS all
+
+abelsub <- sheepabel[,which(chromosome(sheepabel) %in% c(0, "X"))]
+
+abelsub2 <- add.phdata(abelsub, predtab)
+modelabel <-qtscore(Resid.Mean ~ sex, data = abelsub2)
+gwastab <- rbind(gwastab, cbind(results(modelabel), Analysis = "all"))
+
+rm(abelsub2, modelabel)
+
+#~~ GWAS male
+
+abelsub2 <- add.phdata(abelsub, predtab.m)
+modelabel <-qtscore(Resid.Mean, data = abelsub2)
+gwastab <- rbind(gwastab, cbind(results(modelabel), Analysis = "male"))
+
+rm(abelsub2, modelabel)
+
+#~~ GWAS female
+
+abelsub2 <- add.phdata(abelsub, predtab.f)
+modelabel <-qtscore(Resid.Mean, data = abelsub2)
+gwastab <- rbind(gwastab, cbind(results(modelabel), Analysis = "female"))
+
+rm(abelsub2, modelabel)
+
+save(gwastab, resultstab, file = "results/2_GWAS_trans_RR.RData")
+
+```
+
+```{r echo = F, message=F}
+load("results/2_GWAS_trans_RR.RData")
+
+head(maptab)
+newmap <- maptab[,c("SNP.Name", "Chr", "GenomicPosition", "Cumu")]
+names(newmap)[2:3] <- c("Chromosome", "Position")
+newmap$Chromosome[which(newmap$Chromosome == 27)] <- "X"
+
+gwastab <- join(gwastab, newmap)
+
+gwastab <- join(gwastab, maf.info)
+
+head(gwastab)
+gwastab$Cumu[which(gwastab$Chromosome == 0)] <- 0
+
+lambda <- tapply(gwastab$chi2.1df, gwastab$Analysis, median)/median(rchisq(nrow(gwastab)/3, 1))
+write.table(gwastab, "results/2_GWAS_Results_trans.txt", row.names = F, sep = "\t", quote = F)
+# lambda <- median(gwastab$chi2.1df)/median(rchisq(nrow(gwastab), 1)) # generate a null chisq2 distribution
+```
+All sheep:
+
+```{r echo = F, fig.width = 10}
+
+subtab <- gwastab[which(gwastab$Analysis == "all"),]
+multiplot(FullGwasPlot(cumu.object = subtab, corrected = T,bonf = Pthresh, lambda = lambda[1]),
+          FullPpPlot(cumu.object = subtab, corrected = T, lambda = lambda[1]),
+          cols = 2, layout = matrix(c(1, 1, 2), nrow=1, byrow=T))
+arrange(subtab, Pc1df)[1:10,]
+rm(subtab)
+
+```
+
+Male sheep:
+
+```{r echo = F, fig.width = 10}
+#~~ Males
+
+subtab <- gwastab[which(gwastab$Analysis == "male"),]
+multiplot(FullGwasPlot(cumu.object = subtab, corrected = T,bonf = Pthresh, lambda = lambda[2]),
+          FullPpPlot(cumu.object = subtab, corrected = T, lambda = lambda[2]),
+          cols = 2, layout = matrix(c(1, 1, 2), nrow=1, byrow=T))
+arrange(subtab, Pc1df)[1:10,]
+rm(subtab)
+
+```
+
+Female sheep:
+
+```{r echo = F, fig.width = 10}
+
+subtab <- gwastab[which(gwastab$Analysis == "female"),]
+multiplot(FullGwasPlot(cumu.object = subtab, corrected = T,bonf = Pthresh, lambda = lambda[3]),
+          FullPpPlot(cumu.object = subtab, corrected = T, lambda = lambda[3]),
+          cols = 2, layout = matrix(c(1, 1, 2), nrow=1, byrow=T))
+arrange(subtab, Pc1df)[1:10,]
+rm(subtab)
+
+```
+
+
+# 6. Chromosome Partitioning Analysis
+
+In the following models, the contribution of each chromosome to the heritability is determined by fitting two relatedness matrices in the model - the first matrix is constructed using SNPs only from the focal chromosome, whereas the second matrix is constructed using all remaining autosomal SNPs (i.e. excluding the focal chromosome).
+
+```{r eval = F, echo = F, results = "hide", fig.width = 10}
+
+recsumm$RRID2 <- recsumm$RRID
+recsumm.m$RRID2 <- recsumm.m$RRID
+recsumm.f$RRID2 <- recsumm.f$RRID
+
+partitionmodels <- NULL
+
+for(i in 1:26){
+  
+  print(paste("Analysing Chromosome", i, "of 26"))
+  load(paste0("gcta/chr_partitioning/Chr_", i, "_GRMs.Rdata"))
+  
+  grm.chr   <- makeGRM(grm.chr  , ids.chr  , recsumm$RRID)
+  grm.wochr <- makeGRM(grm.wochr, ids.wochr, recsumm$RRID)
+  
+  # Trans effects only
+  
+  temptab <- droplevels(subset(rectab, Chr != i))
+  temprecsumm <- data.frame(TotalRecombCount.wochr = unlist(tapply(temptab$RecombCount.v2, temptab$UniqueID2, sum)),
+                            TotalChromosomeLength = unlist(tapply(as.numeric(temptab$Inf.Chr.Length), temptab$UniqueID2, sum)))
+  
+  
+  temprecsumm$UniqueID2 <- row.names(temprecsumm)
+  temprecsumm <- join(temprecsumm, recsumm)
+  temprecsumm.m <- droplevels(subset(temprecsumm, RRID.SEX == "Male"))
+  temprecsumm.f <- droplevels(subset(temprecsumm, RRID.SEX == "Female"))
+  
+  #~~ All sheep
+  
+  tempmod.li <- asreml(fixed = TotalRecombCount.wochr ~ factor(RRID.SEX) + RRID.Fhat3,
+                       random = ~ giv(RRID) + ide(RRID),
+                       data = temprecsumm,
+                       ginverse =  list(RRID = grm.wochr),
+                       na.method.X = "omit", na.omit.Y = "na.omit",
+                       workspace = 500e+6, pworkspace = 500e+6)
+  
+  tempmod <- asreml(fixed = TotalRecombCount.wochr ~ factor(RRID.SEX) + RRID.Fhat3,
+                    random = ~ giv(RRID) + giv(RRID2) + ide(RRID),
+                    data = temprecsumm,
+                    ginverse =  list(RRID = grm.wochr, RRID2 = grm.chr),
+                    na.method.X = "omit", na.omit.Y = "na.omit",
+                    workspace = 500e+6, pworkspace = 500e+6)
+  
+  x <- ASReml.EstEffects(tempmod)
+  x$Chr <- i
+  x$VarComp <- row.names(x)
+  x$LogL <- summary(tempmod)$loglik
+  x$LogL.wochr <- summary(tempmod.li)$loglik
+  x$Analysis <- "trans only"
+  x$SEX <- "All"
+  
+  partitionmodels <- rbind(partitionmodels, x)
+  
+  rm(tempmod, tempmod.li, x)
+  
+  #~~ Male sheep
+  
+  tempmod.li <- asreml(fixed = TotalRecombCount.wochr ~ RRID.Fhat3,
+                       random = ~ giv(RRID) + ide(RRID),
+                       data = temprecsumm.m,
+                       ginverse =  list(RRID = grm.wochr),
+                       na.method.X = "omit", na.omit.Y = "na.omit",
+                       workspace = 500e+6, pworkspace = 500e+6)
+  
+  tempmod <- asreml(fixed = TotalRecombCount.wochr ~ RRID.Fhat3,
+                    random = ~ giv(RRID) + giv(RRID2) + ide(RRID),
+                    data = temprecsumm.m,
+                    ginverse =  list(RRID = grm.wochr, RRID2 = grm.chr),
+                    na.method.X = "omit", na.omit.Y = "na.omit",
+                    workspace = 500e+6, pworkspace = 500e+6)
+  
+  x <- ASReml.EstEffects(tempmod)
+  x$Chr <- i
+  x$VarComp <- row.names(x)
+  x$LogL <- summary(tempmod)$loglik
+  x$LogL.wochr <- summary(tempmod.li)$loglik
+  x$Analysis <- "trans only"
+  x$SEX <- "Male"
+  
+  partitionmodels <- rbind(partitionmodels, x)
+  
+  rm(tempmod, tempmod.li, x)
+  
+  ##~~ Female sheep
+  
+  tempmod.li <- asreml(fixed = TotalRecombCount.wochr ~ RRID.Fhat3,
+                       random = ~ giv(RRID) + ide(RRID),
+                       data = temprecsumm.f,
+                       ginverse =  list(RRID = grm.wochr),
+                       na.method.X = "omit", na.omit.Y = "na.omit",
+                       workspace = 500e+6, pworkspace = 500e+6)
+  
+  tempmod <- asreml(fixed = TotalRecombCount.wochr ~ RRID.Fhat3,
+                    random = ~ giv(RRID) + giv(RRID2) + ide(RRID),
+                    data = temprecsumm.f,
+                    ginverse =  list(RRID = grm.wochr, RRID2 = grm.chr),
+                    na.method.X = "omit", na.omit.Y = "na.omit",
+                    workspace = 500e+6, pworkspace = 500e+6)
+  
+  x <- ASReml.EstEffects(tempmod)
+  x$Chr <- i
+  x$VarComp <- row.names(x)
+  x$LogL <- summary(tempmod)$loglik
+  x$LogL.wochr <- summary(tempmod.li)$loglik
+  x$Analysis <- "trans only"
+  x$SEX <- "Female"
+  
+  partitionmodels <- rbind(partitionmodels, x)
+  
+  rm(tempmod, tempmod.li, x)
+  
+  gc()
+  
+  rm(grm.chr, grm.wochr, temptab, temprecsumm)
+  }
+
+maxvals <- read.table("results/2_MaxVals_g.txt", header = T)
+head(maxvals)
+partitionmodels <- join(partitionmodels, maxvals)
+
+write.table(partitionmodels, "results/2_Chromosome_Partition_Logliks.txt", row.names = F, sep = "\t", quote = F)
+
+# cis and trans effects
+
+partitionmodelscistrans <- NULL
+
+for(i in 1:26){
+  
+  print(paste("Analysing Chromosome", i, "of 26"))
+  load(paste0("gcta/chr_partitioning/Chr_", i, "_GRMs.Rdata"))
+  
+  grm.chr   <- makeGRM(grm.chr  , ids.chr  , recsumm$RRID)
+  grm.wochr <- makeGRM(grm.wochr, ids.wochr, recsumm$RRID)
+    
+  #~~ All sheep
+  
+  tempmod.li <- asreml(fixed = TotalRecombCount ~ factor(RRID.SEX) + RRID.Fhat3,
+                       random = ~ giv(RRID) + ide(RRID),
+                       data = recsumm,
+                       ginverse =  list(RRID = grm.wochr),
+                       na.method.X = "omit", na.omit.Y = "na.omit",
+                       workspace = 500e+6, pworkspace = 500e+6)
+  
+  tempmod <- asreml(fixed = TotalRecombCount ~ factor(RRID.SEX) + RRID.Fhat3,
+                    random = ~ giv(RRID) + giv(RRID2) + ide(RRID),
+                    data = recsumm,
+                    ginverse =  list(RRID = grm.wochr, RRID2 = grm.chr),
+                    na.method.X = "omit", na.omit.Y = "na.omit",
+                    workspace = 500e+6, pworkspace = 500e+6)
+  
+  x <- ASReml.EstEffects(tempmod)
+  x$Chr <- i
+  x$VarComp <- row.names(x)
+  x$LogL <- summary(tempmod)$loglik
+  x$LogL.wochr <- summary(tempmod.li)$loglik
+  x$Analysis <- "cis&trans"
+  x$SEX <- "All"
+  
+  partitionmodelscistrans  <- rbind(partitionmodelscistrans , x)
+  
+  rm(tempmod, tempmod.li, x)
+  
+  #~~ Male sheep
+  
+  tempmod.li <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                       random = ~ giv(RRID) + ide(RRID),
+                       data = recsumm.m,
+                       ginverse =  list(RRID = grm.wochr),
+                       na.method.X = "omit", na.omit.Y = "na.omit",
+                       workspace = 500e+6, pworkspace = 500e+6)
+  
+  tempmod <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                    random = ~ giv(RRID) + giv(RRID2) + ide(RRID),
+                    data = recsumm.m,
+                    ginverse =  list(RRID = grm.wochr, RRID2 = grm.chr),
+                    na.method.X = "omit", na.omit.Y = "na.omit",
+                    workspace = 500e+6, pworkspace = 500e+6)
+  
+  x <- ASReml.EstEffects(tempmod)
+  x$Chr <- i
+  x$VarComp <- row.names(x)
+  x$LogL <- summary(tempmod)$loglik
+  x$LogL.wochr <- summary(tempmod.li)$loglik
+  x$Analysis <- "cis&trans"
+  x$SEX <- "Male"
+  
+  partitionmodelscistrans  <- rbind(partitionmodelscistrans , x)
+  
+  rm(tempmod, tempmod.li, x)
+  
+  ##~~ Female sheep
+  
+  tempmod.li <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                       random = ~ giv(RRID) + ide(RRID),
+                       data = recsumm.f,
+                       ginverse =  list(RRID = grm.wochr),
+                       na.method.X = "omit", na.omit.Y = "na.omit",
+                       workspace = 500e+6, pworkspace = 500e+6)
+  
+  tempmod <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                    random = ~ giv(RRID) + giv(RRID2) + ide(RRID),
+                    data = recsumm.f,
+                    ginverse =  list(RRID = grm.wochr, RRID2 = grm.chr),
+                    na.method.X = "omit", na.omit.Y = "na.omit",
+                    workspace = 500e+6, pworkspace = 500e+6)
+  
+  x <- ASReml.EstEffects(tempmod)
+  x$Chr <- i
+  x$VarComp <- row.names(x)
+  x$LogL <- summary(tempmod)$loglik
+  x$LogL.wochr <- summary(tempmod.li)$loglik
+  x$Analysis <- "cis&trans"
+  x$SEX <- "Female"
+  
+  partitionmodelscistrans  <- rbind(partitionmodelscistrans , x)
+  
+  rm(tempmod, tempmod.li, x)
+  
+  gc()
+  
+  rm(grm.chr, grm.wochr, temptab, temprecsumm)
+  }
+
+partitionmodelscistrans  <- join(partitionmodelscistrans , maxvals)
+partitionmodelscistrans$Analysis <- "cis&trans"
+write.table(partitionmodelscistrans , "results/2_Chromosome_Partition_LogliksCistrans.txt", row.names = F, sep = "\t", quote = F)
+
+
+
+```
+
+```{r echo = F, results = "hide", fig.width = 10}
+
+partitionmodels <- read.table("results/2_Chromosome_Partition_Logliks.txt", sep = "\t", header = T)
+
+head(partitionmodels)
+
+chreffect <- subset(partitionmodels, VarComp == "giv(RRID2).giv")
+
+chreffect$Pval <- 1 - pchisq(2*(chreffect$LogL - chreffect$LogL.wochr), df = 1)
+chreffect$sig <- ifelse(chreffect$Pval < 0.01, "**", ifelse(chreffect$Pval < 0.05, "*", ""))
+
+ggplot(subset(chreffect, Analysis == "trans only"), aes(maxGenome, Effect)) +
+  stat_smooth(method = "lm") +
+  geom_hline(yintercept = 0, colour = "darkgrey") +
+  geom_errorbar(aes(ymin = Effect - SE, ymax = Effect + SE), width = 0) +
+  geom_point(alpha = 1, size = 9, col = "black") +
+  geom_point(alpha = 1, size = 8, col = "white") +
+  geom_text(aes(label = Chr), size = 4) +
+  geom_text(aes(label = sig), size = 8, hjust=-0.5, vjust=0) +
+  facet_wrap(~SEX, scales = "free_y") +
+  defopts +
+  scale_x_continuous(breaks = seq(0, max(chreffect$maxGenome), 50000000), labels = seq(0, max(chreffect$maxGenome), 50000000)/1e6) +
+  labs(x = "Chromosome Length (MB)", y = "Proportion of VP explained")
+
+
+```
+```{r}
+tapply(chreffect$Effect, chreffect$SEX, sum)
+```
+
+
+### 7. Regional Heritability Analysis. MUST BE EDITED 27/03/2015
+
+Code indicates Run Prefix, window size, chromosomes run, cis- vs trans- analysis. Analyses were conducted in all sheep combined, male sheep only and females sheep only.
+
+
+```{r eval = F, echo = F, fig.width = 13, results = "hide"}
+
+for(h in c("Run_c.ps_20SNP_Chrall_cistrans",
+           "Run_b.ps_50SNP_Chrall_cistrans",
+           "Run_a.ps_150SNP_Chrall_cistrans")){
+
+  setwd(paste0("gcta/", h))
+  
+  snplistvec <- read.table("snplistvec.txt", stringsAsFactors = F)
+  parameters <- readLines("parameters.txt")
+  
+  print(paste0("Regional Heritability Analysis ", parameters[1],", ",
+               parameters[2], " SNP Window with ", parameters[3], " overlap. ",
+               "Chrs examined: ", parameters[5], ", Recombination type: ", parameters[6]))
+  
+  head(snplistvec)
+  
+  snplistvec$snpcount      <- NA
+  snplistvec$FirstPos      <- NA
+  snplistvec$LastPos       <- NA
+  snplistvec$MedianPos     <- NA
+  snplistvec$MedianCumuPos <- NA
+  
+  for(i in 1:nrow(snplistvec)){
+    
+    if(i %in% seq(1, nrow(snplistvec), 100)) print(paste("Analysing row", i, "of", nrow(snplistvec)))
+    
+    x <- read.table(paste0(snplistvec$V1[i], "snplist.txt"), stringsAsFactors = F)
+    x <- x[which(!is.na(x)),]
+    snplistvec$snpcount[i] <- length(x)
+    
+    
+    if(length(x) > 0){
+      snplistvec$FirstPos[i]      <- maptab$GenomicPosition[which(maptab$SNP.Name == x[1])]
+      snplistvec$LastPos[i]       <- maptab$GenomicPosition[which(maptab$SNP.Name == x[length(x)])]
+      snplistvec$MedianPos[i]     <- median(maptab$GenomicPosition[which(maptab$SNP.Name %in% x)])
+      snplistvec$MedianCumuPos[i] <- median(maptab$Cumu[which(maptab$SNP.Name %in% x)])
+      }
+    }
+  
+  
+  snplistvec <- subset(snplistvec, snpcount > as.numeric(parameters[3]))
+  
+  snplistvec$Chr <- unlist(lapply(snplistvec$V1, function (x) strsplit(x, split = "\\.")[[1]][1]))
+  snplistvec$Chr <- gsub("chr", "", snplistvec$Chr)
+  
+  head(snplistvec)
+  
+  snplistvec$Genome.GRM.LL     <- NA
+  snplistvec$Genome.Reg.GRM.LL <- NA
+  snplistvec$Reg.h2            <- NA
+  snplistvec$Reg.h2.SE         <- NA
+  snplistvec$Genome.Rest.h2    <- NA
+  snplistvec$Genome.Rest.h2.SE <- NA
+  snplistvec$Error             <- "none"
+  snplistvec$Reg.h2.constraint <- NA
+  
+  snplistvec <- rbind(cbind(snplistvec, Sex = "Both"),
+                      cbind(snplistvec, Sex = "Male"),
+                      cbind(snplistvec, Sex = "Female"))
+  
+  for(i in 1:nrow(snplistvec)){
+    
+    if(i %in% seq(1, nrow(snplistvec), 100)) print(paste("Analysing row", i, "of", nrow(snplistvec), Sys.time()))
+    
+    
+    if(file.exists(paste0("model", snplistvec$V1[i], ".RData"))){
+      
+      load(paste0("model", snplistvec$V1[i], ".RData"))
+      
+      if(snplistvec$Sex[i] == "Both"){
+        
+        snplistvec$Genome.GRM.LL[i]     <- obj1.3
+        snplistvec$Genome.Reg.GRM.LL[i] <- obj2.3
+        snplistvec$Reg.h2[i]            <- obj2.2$Effect[2]
+        snplistvec$Reg.h2.SE[i]         <- obj2.2$SE[2]
+        snplistvec$Genome.Rest.h2[i]    <- obj2.2$Effect[1]
+        snplistvec$Genome.Rest.h2.SE[i] <- obj2.2$SE[1]
+        snplistvec$Reg.h2.constraint[i] <- as.character(obj2.2$constraint[2])
+        
+        
+        rm(list=ls(pattern="^obj"))
+        }
+      
+      if(snplistvec$Sex[i] == "Male"){
+        
+        snplistvec$Genome.GRM.LL[i]     <- obj1.3.m
+        snplistvec$Genome.Reg.GRM.LL[i] <- obj2.3.m
+        snplistvec$Reg.h2[i]            <- obj2.2.m$Effect[2]
+        snplistvec$Reg.h2.SE[i]         <- obj2.2.m$SE[2]
+        snplistvec$Genome.Rest.h2[i]    <- obj2.2.m$Effect[1]
+        snplistvec$Genome.Rest.h2.SE[i] <- obj2.2.m$SE[1]
+        snplistvec$Reg.h2.constraint[i] <- as.character(obj2.2.m$constraint[2])
+        
+        
+        rm(list=ls(pattern="^obj"))
+        }
+      
+      if(snplistvec$Sex[i] == "Female"){
+        
+        snplistvec$Genome.GRM.LL[i]     <- obj1.3.f
+        snplistvec$Genome.Reg.GRM.LL[i] <- obj2.3.f
+        snplistvec$Reg.h2[i]            <- obj2.2.f$Effect[2]
+        snplistvec$Reg.h2.SE[i]         <- obj2.2.f$SE[2]
+        snplistvec$Genome.Rest.h2[i]    <- obj2.2.f$Effect[1]
+        snplistvec$Genome.Rest.h2.SE[i] <- obj2.2.f$SE[1]
+        snplistvec$Reg.h2.constraint[i] <- as.character(obj2.2.f$constraint[2])
+
+        
+        rm(list=ls(pattern="^obj"))
+        }
+      
+      }
+    
+    if(file.exists(paste0("partition_", snplistvec$V1[i], ".Rout"))){
+      
+      rout <- readLines(paste0("partition_", snplistvec$V1[i], ".Rout"))
+      if(length(grep("Abnormal termination", rout)) > 0) snplistvec$Error[i] <- "A.T."
+      
+      rm(rout)
+      }
+    
+    }
+  
+  
+  head(snplistvec)
+  
+  snplistvec$Chi.Value <- 2*(snplistvec$Genome.Reg.GRM.LL - snplistvec$Genome.GRM.LL)
+  
+  
+  snplistvec$Chr <- as.numeric(snplistvec$Chr)
+  
+  snplistvec$Chi.Value[which(snplistvec$Chi.Value < 0)] <- 0
+  
+  snplistvec$P <- 1 - pchisq(snplistvec$Chi.Value, 1)
+  
+  snplistvec <- arrange(snplistvec, Chr, MedianPos)
+  snplistvec$Order <- 1:nrow(snplistvec)
+  
+  #~~ Fix formatting variables for graph
+  
+  snplistvec$Colour <- "1"
+  snplistvec$Colour[which(snplistvec$Chr %in% seq(2, 26, 2))] <- "2"
+  
+  sigtab <- snplistvec[which(snplistvec$P < 0.05/(nrow(snplistvec)/6)),]
+  
+  #   if(nrow(sigtab) < 6) print(sigtab)
+  #   if(nrow(sigtab) > 5) print(arrange(sigtab, P)[1:5,])
+  
+  sigtab <- arrange(sigtab, Sex, P)
+  print(sigtab)
+  
+  write.table(snplistvec, paste0("../../results/2_Regional_Heritability_", h, ".txt"), row.names = F, sep = "\t", quote = F)
+  
+  rm(snplistvec, parameters)
+  
+  setwd("../..")
+  }
+
+
+```
+
+
+```{r eval = F}
+
+chr7.c.ps.351.20
+chr6.c.ps.1827.20
+
+
+# cat chr6.c.ps.1827.20snplist.txt chr7.c.ps.351.20snplist.txt > newsnps.txt
+# ../gcta64 --bfile ../20150129merged1_66nodups.QC2 --autosome-num 26 --autosome --exclude newsnps.txt --keep ../idlist.txt --make-grm-gz --out without6and7.20_GRM
+# ../gcta64 --grm-gz without6and7.20_GRM --grm-adj 0 --make-grm-gz --out without6and7.20_GRM_adj
+
+# ../gcta64 --bfile ../20150129merged1_66nodups.QC2 --autosome-num 26 --extract chr6.c.ps.1827.20snplist.txt --keep ../idlist.txt --make-grm-gz --out 150204_chr6.c.ps.1827.20_GRM
+# ../gcta64 --grm-gz 150204_chr6.c.ps.1827.20_GRM --grm-adj 0 --make-grm-gz --out 150204_chr6.c.ps.1827.20_GRM_adj
+# 
+# ../gcta64 --bfile ../20150129merged1_66nodups.QC2 --autosome-num 26 --extract chr7.c.ps.351.20snplist.txt --keep ../idlist.txt --make-grm-gz --out 150204_chr7.c.ps.351.20_GRM
+# ../gcta64 --grm-gz 150204_chr7.c.ps.351.20_GRM --grm-adj 0 --make-grm-gz --out 150204_chr7.c.ps.351.20_GRM_adj
+
+
+# ALL IDS
+
+grm.rest <- read.table(paste0("gcta/Run_c.ps_20SNP_Chrall_cistrans/without6and7.20_GRM_adj.grm.gz"))
+ids.rest <- read.table(paste0("gcta/Run_c.ps_20SNP_Chrall_cistrans/without6and7.20_GRM_adj.grm.id"))
+
+grm.reg7 <- read.table(paste0("gcta/Run_c.ps_20SNP_Chrall_cistrans/150204_chr7.c.ps.351.20_GRM_adj.grm.gz"))
+ids.reg7 <- read.table(paste0("gcta/Run_c.ps_20SNP_Chrall_cistrans/150204_chr7.c.ps.351.20_GRM_adj.grm.id"))
+
+grm.reg6 <- read.table(paste0("gcta/Run_c.ps_20SNP_Chrall_cistrans/150204_chr6.c.ps.1827.20_GRM_adj.grm.gz"))
+ids.reg6 <- read.table(paste0("gcta/Run_c.ps_20SNP_Chrall_cistrans/150204_chr6.c.ps.1827.20_GRM_adj.grm.id"))
+
+
+restinv <- makeGRM(grm.rest, ids.rest)
+reg6inv  <- makeGRM(grm.reg6, ids.reg6)
+reg7inv  <- makeGRM(grm.reg7, ids.reg7)
+
+recsumm$RRID2 <- recsumm$RRID
+recsumm$RRID3 <- recsumm$RRID
+
+
+# model1 <- asreml(fixed = AnalysisRecombRate ~ factor(RRID.SEX) + RRID.Fhat3,
+#                  random = ~ giv(RRID) + ide(RRID),
+#                  data = recsumm,
+#                  ginverse =  list(RRID = restinv),
+#                  na.method.X = "omit", na.omit.Y = "na.omit",
+#                  workspace = 500e+6, pworkspace = 500e+6)
+
+model.both <- asreml(fixed = TotalRecombCount ~ factor(RRID.SEX) + RRID.Fhat3,
+                     random = ~ giv(RRID) + giv(RRID2) + giv(RRID3) + ide(RRID),
+                     data = recsumm,
+                     ginverse =  list(RRID = restinv, RRID2 = reg6inv, RRID3 = reg7inv),
+                     na.method.X = "omit", na.omit.Y = "na.omit",
+                     workspace = 500e+6, pworkspace = 500e+6)
+
+
+
+summary(model.both, all = T)$coef.fixed
+ASReml.EstEffects(model.both)
+summary(model.both, all = T)$loglik 
+
+model.female <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                     random = ~ giv(RRID) + giv(RRID2) + giv(RRID3) + ide(RRID),
+                     data = droplevels(subset(recsumm, RRID.SEX == "Female")),
+                     ginverse =  list(RRID = restinv, RRID2 = reg6inv, RRID3 = reg7inv),
+                     na.method.X = "omit", na.omit.Y = "na.omit",
+                     workspace = 500e+6, pworkspace = 500e+6)
+
+
+
+summary(model.female, all = T)$coef.fixed
+ASReml.EstEffects(model.female)
+summary(model.female, all = T)$loglik 
+
+model.male <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3,
+                     random = ~ giv(RRID) + giv(RRID2) + giv(RRID3) + ide(RRID),
+                     data = droplevels(subset(recsumm, RRID.SEX == "Male")),
+                     ginverse =  list(RRID = restinv, RRID2 = reg6inv, RRID3 = reg7inv),
+                     na.method.X = "omit", na.omit.Y = "na.omit",
+                     workspace = 500e+6, pworkspace = 500e+6)
+
+
+
+summary(model.male, all = T)$coef.fixed
+ASReml.EstEffects(model.male)
+summary(model.male, all = T)$loglik 
+
+save(model.both, model.female, model.male, file = "results/bivarchr6and7.Rdata")
+rm(model.both, model.female, model.male)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+h = analysis.vec[3]
+snplistvec <- read.table(paste0("results/2_Regional_Heritability_", h, ".txt"), header = T)
+snplistvec$Chr <- factor(snplistvec$Chr)
+snplistvec$Colour <- factor(snplistvec$Colour)
+
+snplistvec$Sex <- factor(snplistvec$Sex, levels = c("Both", "Male", "Female"))
+ggplot(snplistvec, aes(MedianCumuPos, -log10(P), col = Colour, group = Chr)) + 
+  geom_point() +
+  theme_bw() +
+  geom_line() +
+  scale_color_brewer(palette = "Set1") +
+  theme(axis.text.x  = element_text (size = 16, vjust = 0),
+        axis.text.y  = element_text (size = 14, hjust = 1.3),
+        strip.text.x = element_text (size = 16, vjust = 0.7),
+        axis.title.y = element_text (size = 16, angle = 90, vjust = 0.2),
+        axis.title.x = element_text (size = 16, vjust = 0.2)) +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = -log10(0.05/(nrow(snplistvec)/2))) + 
+  scale_x_continuous(breaks = tapply(maptab$Cumu, maptab$Chr, median)[1:26],
+                     labels = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "",
+                                12,"",14,"",16,"",18,"","",21,"","",24,"","")) +
+  labs(x = "Chromosome", y = "-log10(P)") +
+  facet_wrap(~Sex, ncol = 1)
+
+
+load("gcta/Run_c.ps_20SNP_ChrChrall_trans/chr6.c.ps.1827.20.Rdata")
+
+
+h = analysis.vec[5]
+snplistvec <- read.table(paste0("results/2_Regional_Heritability_", h, ".txt"), header = T)
+snplistvec$Chr <- factor(snplistvec$Chr)
+snplistvec$Colour <- factor(snplistvec$Colour)
+
+ggplot(subset(snplistvec, Sex == "Female"), aes(MedianPos/1e6, -log10(P), col = Colour, group = Chr)) + 
+  geom_point(size = 2) +
+  theme_bw() +
+  geom_line() +
+  scale_color_brewer(palette = "Set1") +
+    theme(axis.text.x  = element_text (size = 16, vjust = 0),
+        axis.text.y  = element_text (size = 14, hjust = 1.3),
+        strip.text.x = element_text (size = 16, vjust = 0.7),
+        axis.title.y = element_text (size = 16, angle = 90, vjust = 0.2),
+        axis.title.x = element_text (size = 16, vjust = 0.2)) +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = -log10(0.05/(nrow(snplistvec)/6))) + 
+  labs(x = "Median Position (Mb)", y = "-log10(P)")
+
+genes <- read.table("C:/Users/Susan Johnston/Desktop/Sheep Genome Oar_v3.1/GeneListv1.78.txt", header = T, sep = "\t")
+
+geneplot <- subset(genes, Chromosome == "6" & Start > 105000000)
+geneplot$MidPos <- apply(geneplot[,c("Start", "Stop")], 1, mean)
+
+geneplot <- arrange(geneplot, Start)
+
+genemelt <- melt(cbind(id = 1:nrow(geneplot), geneplot[,c("Start", "Stop")]), id.vars = "id")
+genemelt = subset(genemelt, !id %in% c(30, 64))
+
+
+ggplot() + 
+  geom_point(data = subset(snplistvec, Sex == "Female"), aes(x = MedianPos, y = -log10(P), col = Colour, group = Chr), size = 2) +
+  theme_bw() +
+  geom_line(data = subset(snplistvec, Sex == "Female"), aes(x = MedianPos, y = -log10(P), col = Colour, group = Chr)) +
+  scale_color_brewer(palette = "Set1") +
+    theme(axis.text.x  = element_text (size = 16, vjust = 0),
+        axis.text.y  = element_text (size = 14, hjust = 1.3),
+        strip.text.x = element_text (size = 16, vjust = 0.7),
+        axis.title.y = element_text (size = 16, angle = 90, vjust = 0.2),
+        axis.title.x = element_text (size = 16, vjust = 0.2)) +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = -log10(0.05/1916)) + 
+  labs(x = "Median Position (Mb)", y = "-log10(P)") +
+  geom_line(data = genemelt, aes(value, -log10(min(snplistvec$P, na.rm = T)) + 1, group = id), size = 6) +
+  geom_text(data = geneplot, aes(MidPos, -log10(min(snplistvec$P, na.rm = T)) + 3, label = Gene.Name), angle = 270, size = 4) +
+  coord_cartesian(ylim = c(-0.25, -log10(min(snplistvec$P, na.rm = T)) + 5),
+                  xlim = c(105000000, 117100000)) +
+  geom_segment(x = 116442905, y = -log10(min(snplistvec$P, na.rm = T)) + 1,
+               xend = 116430959, yend = -log10(min(snplistvec$Pc1df)) + 1,
+               colour = "black", size = 6) +
+  geom_text(label = "RNF212", x = mean(116430959, 116442905), y = -log10(min(temp3$Pc1df)) + 2, angle = 270, size = 4, colour = "black") +
+  scale_x_continuous(breaks = seq(105e6, 117e6, 2.5e6), labels = seq(105, 117, 2.5)) 
+
+
+```
+
+
+
+
+```{r echo = F, fig.width = 10}
+
+for(h in analysis.vec){
+  
+  snplistvec <- read.table(paste0("results/2_Regional_Heritability_", h, ".txt"), header = T)
+  snplistvec$Chr <- factor(snplistvec$Chr)
+  snplistvec$Colour <- factor(snplistvec$Colour)
+  
+  
+  if(length(unique(snplistvec$Chr)) > 10){
+    
+    print(ggplot(snplistvec, aes(MedianCumuPos, -log10(P), col = Colour, group = Chr)) + 
+            geom_point(size = 2, aes(shape = Error)) +
+            theme_bw() +
+            geom_line() +
+            scale_color_brewer(palette = "Set1") +
+            defopts +
+            #theme(legend.position = "none") +
+            geom_hline(yintercept = -log10(0.05/(nrow(snplistvec)/2))) + 
+            scale_x_continuous(breaks = tapply(maptab$Cumu, maptab$Chr, median)[1:26], labels = 1:26) +
+            labs(x = "Chromosome", y = "-log10(P)", title = h) +
+            facet_wrap(~Sex, ncol = 1))
+    }
+  
+  
+  if(length(unique(snplistvec$Chr)) < 10){
+    print(ggplot(snplistvec, aes(MedianPos, -log10(P), col = Colour, group = Chr)) + 
+            geom_point(size = 2, aes(shape = Error)) +
+            theme_bw() +
+            geom_line() +
+            scale_color_brewer(palette = "Set1") +
+            defopts +
+            geom_hline(yintercept = -log10(0.05/(nrow(snplistvec)/6))) + 
+            labs(x = "Median Position (bp)", y = "-log10(P)", title = h) +
+            facet_grid(Sex~Chr, scales = "free_x"))
+    
+    }
+  
+  rm(snplistvec)
+  }
+```
+
+```{r eval = F, echo = F}
+print(ggplot(subset(snplistvec, Chr %in% c(6)), aes(MedianPos, -log10(P), col = Colour, group = Chr)) +  
+        geom_point(size = 2, aes(shape = Error)) +
+        theme_bw() +
+        geom_line() +
+        scale_color_brewer(palette = "Set1") +
+        defopts +
+        #theme(legend.position = "none") +
+        geom_hline(yintercept = -log10(0.05/(nrow(snplistvec)/2))) + 
+        scale_x_continuous(breaks = tapply(maptab$Cumu, maptab$Chr, median)[1:26], labels = 1:26) +
+        labs(x = "Chromosome", y = "-log10(P)", title = h) +
+        facet_wrap(~Sex, ncol = 1))
+
+print(ggplot(subset(snplistvec, Chr %in% c(6, 7)), aes(MedianPos, Reg.h2, col = Colour, group = Chr)) + 
+        geom_point() +
+        geom_line() +
+        theme_bw() +
+        defopts +
+        theme(legend.position = "none") +
+        geom_errorbar(aes(ymin = Reg.h2 - Reg.h2.SE, ymax = Reg.h2 + Reg.h2.SE), width = 0, alpha = 0.4) +
+        scale_color_brewer(palette = "Set1") +
+        scale_x_continuous(breaks = tapply(maptab$Cumu, maptab$Chr, median)[1:26], labels = 1:26) +
+        labs(x = "Chromosome", y = "Heritability (h2)", title = h) +
+        facet_grid(Sex~Chr))
+
+}
+```
+
+
+### What proportion of the additive genetic variance is explained by this haplotype?
+
+```{r eval = F, echo = F}
+
+load(paste0("model",  sigtab$V1[1], ".RData"))
+
+obj2.1
+obj2.2["giv(RRID2).giv","Effect"]/(obj2.2["giv(RRID2).giv","Effect"] + obj2.2["giv(RRID).giv","Effect"])
+
+obj2.1.f
+obj2.2.f["giv(RRID2).giv","Effect"]/(obj2.2.f["giv(RRID2).giv","Effect"] + obj2.2.f["giv(RRID).giv","Effect"])
+
+grminv <- makeGRM(grm.auto, ids.auto, recsumm$RRID)
+
+
+#~~ Add genotype to the animal model
+
+sigsnp <- gwastab[which(gwastab$Pc1df == min(gwastab$Pc1df)), "SNP.Name"]
+sigsnptab <- data.frame(SigGeno = as.character.gwaa.data(sheepabel[,sigsnp]))
+sigsnptab$RRID <- row.names(sigsnptab)
+
+recsumm <- join(recsumm, sigsnptab)
+recsumm$s74824.1 <- as.factor(recsumm$s74824.1)
+
+grm.summ.RR.snp <- asreml(fixed = TotalRecombCount ~ RRID.SEX + RRID.Fhat3 + s74824.1,
+                          random = ~ giv(RRID) + ide(RRID) + ide(MOTHER),
+                          data = recsumm,
+                          ginverse =  list(RRID = grminv, MOTHER = ainv),
+                          na.method.X = "omit", na.omit.Y = "na.omit",
+                          workspace = 500e+6, pworkspace = 500e+6)
+
+summary(grm.summ.RR.snp, all = T)$coef.fixed
+ASReml.EstEffects(grm.summ.RR.snp)
+
+
+# MALES ONLY
+grminv <- makeGRM(grm.auto, ids.auto, recsumm.m$RRID)
+
+grm.summ.RR.males.snp <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3 + factor(s74824.1),
+                                random = ~ giv(RRID) + ide(RRID),
+                                data = droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),]),
+                                ginverse =  list(RRID = grminv),
+                                na.method.X = "omit", na.omit.Y = "na.omit",
+                                workspace = 500e+6, pworkspace = 500e+6)
+
+summary(grm.summ.RR.males.snp, all = T)$coef.fixed
+ASReml.EstEffects(grm.summ.RR.males.snp)
+wald.asreml(grm.summ.RR.males.snp)
+
+
+# FEMALES ONLY
+grminv <- makeGRM(grm.auto, ids.auto, recsumm.f$RRID)
+
+grm.summ.RR.females.snp <- asreml(fixed = TotalRecombCount ~ RRID.Fhat3 + factor(s74824.1),
+                                  random = ~ giv(RRID) + ide(RRID) + ide(MOTHER),
+                                  data = droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),]),
+                                  ginverse =  list(RRID = grminv, MOTHER = ainv),
+                                  na.method.X = "omit", na.omit.Y = "na.omit",
+                                  workspace = 500e+6, pworkspace = 500e+6)
+
+summary(grm.summ.RR.females.snp, all = T)$coef.fixed
+ASReml.EstEffects(grm.summ.RR.females.snp)
+wald.asreml(grm.summ.RR.females.snp)
+
+newtab <- rbind(cbind(droplevels(recsumm[which(recsumm$RRID.SEX == "Male"),
+                                   c("RRID", "s74824.1", "RRID.SEX")]),
+                      residuals = grm.summ.RR.males$residuals),
+                cbind(droplevels(recsumm[which(recsumm$RRID.SEX == "Female"),
+                                   c("RRID", "s74824.1", "RRID.SEX")]),
+                      residuals = grm.summ.RR.females$residuals))
+
+newtab2 <- data.frame(rbind(summary(grm.summ.RR.males.snp, all = T)$coef.fixed[1:3,],
+                 summary(grm.summ.RR.females.snp, all = T)$coef.fixed[1:3,]))
+newtab2$RNF212 <- c("A/A", "A/G", "G/G", "A/A", "A/G", "G/G")
+newtab2$RRID.SEX <- c("Male", "Male", "Male", "Female", "Female", "Female")
+newtab2$RRID.SEX2 <- factor(newtab2$RRID.SEX, levels = c("Male", "Female"))
+
+
+ggplot(newtab2, aes(newtab2$RNF212, solution)) + 
+  geom_hline(yintercept = 0, col = "darkgrey") +
+  geom_errorbar(aes(ymin = solution - std.error, ymax = solution + std.error), width = 0.2) + 
+  geom_point(size = 4) +
+  facet_wrap(~RRID.SEX2) +
+  theme_bw() +
+  labs(x = "Tagged Genotype in RNF212 Region",
+       y = "Relative Crossover Count",
+       fill = "") +
+  scale_fill_brewer(palette = "Set1") +
+  theme(axis.text.x  = element_text (size = 16),
+        axis.text.y  = element_text (size = 14),
+        strip.text.x = element_text (size = 16, vjust = 0.7),
+        axis.title.y = element_text (size = 16, angle = 90, vjust = 0.9),
+        axis.title.x = element_text (size = 16, vjust = 0.2),
+        strip.background = element_blank())
+
+head(newtab)
+
+recsumm$RRID.SEX2 <- factor(recsumm$RRID.SEX, levels = c("Male", "Female"))
+ggplot(newtab, aes(s74824.1, residuals)) + 
+  geom_boxplot(notch = T) +
+  facet_wrap(~RRID.SEX)
+
+
+ggplot(recsumm, aes(s74824.1, TotalRecombCount, fill = RRID.SEX2)) + 
+  geom_boxplot(notch = T) +
+  facet_wrap(~RRID.SEX2) +
+  theme_bw() +
+  labs(x = "Tagged Genotype in RNF212 Region",
+       y = "Total Crossover Count",
+       fill = "") +
+  scale_fill_brewer(palette = "Set1") +
+  defopts
+
+
+head(recsumm)
+
+test <- droplevels(unique(subset(recsumm, select = c(RRID.BYEAR, RRID, s74824.1))))
+
+test <- data.frame(matrix(table(test$RRID.BYEAR, test$s74824.1), ncol = 3))
+test$A <- (test$X1 + (0.5*test$X2))/rowSums(test[,1:3])
+test$Year <- 1987:2011
+
+ggplot(test, aes(Year, A)) + geom_line()
+
+test2 <- read.table("data/20140210_SoayBaseData.txt", header = T, sep = "\t", stringsAsFactors = T)
+head(test2)
+test2$RRID <- test2$ID
+test2 <- join(test2, sigsnptab)
+test2 <- droplevels(unique(subset(test2, select = c(BirthYear, RRID, s74824.1))))
+test2 <- droplevels(subset(test2, BirthYear > 1986))
+
+test2 <- data.frame(matrix(table(test2$BirthYear, test2$s74824.1), ncol = 3))
+test2$A <- (test2$X1 + (0.5*test2$X2))/rowSums(test2[,1:3])
+test2$Year <- as.numeric(row.names(test2))
+
+test2 <- subset(test2, !is.nan(A))
+
+ggplot(test2, aes(Year, A)) + geom_line() + stat_smooth(method = "lm")
+
+```
+
