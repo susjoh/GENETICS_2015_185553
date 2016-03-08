@@ -413,7 +413,7 @@ pin(grm.summ.RR.females.x, phen.var ~ V1 + V2 + V4)
 
 ```{r echo = F}
 
-##### 2.2. Bivariate model of heritability in males and females:
+#### 2.2. Bivariate model of heritability in males and females:
 
 
 grminv <- makeGRM(grm.auto, ids.auto, recsumm$RRID)
